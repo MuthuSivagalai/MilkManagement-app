@@ -1,18 +1,32 @@
 import streamlit as st
 import streamlit.components.v1 as components
+import calendar
 from datetime import date, datetime
 import urllib.parse
 from database import (
     init_db, AVAILABLE_ITEMS, get_item_rates, set_item_rate, add_customer, update_customer,
     delete_customer, get_customers, get_customer, get_customer_items, save_delivery, clear_deliveries_for_date,
     get_customer_deliveries_for_date, get_deliveries, get_monthly_summary, add_payment, get_payments,
-    get_dashboard_stats, export_deliveries_csv, export_customers_csv, export_all_customers_monthly_report_csv
+    get_dashboard_stats, export_deliveries_csv, export_customers_csv, export_all_customers_monthly_report_csv,
+    get_item_breakdown_by_date_range, get_daily_breakdown_by_date_range, get_daily_brand_matrix,
+    export_range_deliveries_csv, export_daily_summary_csv
 )
 
 st.set_page_config(page_title="Milk & Curd Delivery Management", page_icon="🥛", layout="wide")
 init_db()
 
-# Initialize Language State
+# ---------------- Credentials Config ----------------
+USER_CREDENTIALS = {
+    "admin": "admin123",
+    "muthu": "muthu123",
+    "pechimuthu": "pechi2026",
+    "staff": "staff123"
+}
+
+# ---------------- Session State Initialization ----------------
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
 if "app_lang" not in st.session_state:
     st.session_state["app_lang"] = "English"
 
@@ -20,6 +34,34 @@ if "app_lang" not in st.session_state:
 def t(en_text, ta_text):
     return ta_text if st.session_state.get("app_lang", "English") == "தமிழ்" else en_text
 
+# ---------------- Login Screen ----------------
+if not st.session_state["authenticated"]:
+    st.markdown("""
+    <style>
+    .login-header { text-align: center; margin-top: 30px; font-weight: bold; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown(f'<h2 class="login-header">{t("🔐 Login to Delivery System", "🔐 விநியோக அமைப்பில் உள்நுழைக")}</h2>', unsafe_allow_html=True)
+        st.markdown("---")
+        with st.form("login_form"):
+            username = st.text_input(t("Username", "பயனர் பெயர்"))
+            password = st.text_input(t("Password", "கடவுச்சொல்"), type="password")
+            submitted = st.form_submit_button(t("🔑 Login", "🔑 உள்நுழைக"), type="primary", use_container_width=True)
+            
+            if submitted:
+                if username in USER_CREDENTIALS and USER_CREDENTIALS[username] == password:
+                    st.session_state["authenticated"] = True
+                    st.session_state["username"] = username
+                    st.toast(t("✅ Login successful!", "✅ வெற்றிகரமாக உள்நுழைந்துள்ளீர்கள்!"), icon="🎉")
+                    st.rerun()
+                else:
+                    st.error(t("❌ Invalid Username or Password", "❌ தவறான பயனர் பெயர் அல்லது கடவுச்சொல்"))
+    st.stop()
+
+# ---------------- Custom CSS ----------------
 st.markdown("""
 <style>
 .main-title {font-size: 32px; font-weight: bold;}
@@ -40,14 +82,22 @@ st.markdown("""
 top_col1, top_col2 = st.columns([3, 1])
 with top_col1:
     st.markdown(f'<div class="main-title">{t("🥛 Milk & Curd Delivery Management", "🥛 பால் & தயிர் விநியோக மேலாண்மை")}</div>', unsafe_allow_html=True)
-    st.caption(t("Multi-Brand Customer Management • Dynamic Add Buttons • Dual Language Billing • Reports", 
-                 "வாடிக்கையாளர் மேலாண்மை • தமிழ் & ஆங்கில பில்லிங் • அறிக்கைகள்"))
+    st.caption(t("Multi-Brand Customer Management • Dynamic Add Buttons • Dual Language Billing • Profit Tracking", 
+                 "வாடிக்கையாளர் மேலாண்மை • தமிழ் & ஆங்கில பில்லிங் • லாப கணக்கீடு"))
 
 with top_col2:
     st.radio("🌐 Language / மொழி", ["English", "தமிழ்"], key="app_lang", horizontal=True)
 
-menu_options_en = ["🏠 Dashboard", "⚙️ Item Rates", "👥 Customers", "🥛 Daily Delivery", "🧾 Billing & Receipts", "💵 Payments", "📊 Reports"]
+menu_options_en = ["🏠 Dashboard", "⚙️️ Item Rates", "👥 Customers", "🥛 Daily Delivery", "🧾 Billing & Receipts", "💵 Payments", "📊 Reports"]
 menu_options_ta = ["🏠 டாஷ்போர்டு", "⚙️ பொருள் விலைகள்", "👥 வாடிக்கையாளர்கள்", "🥛 தினசரி விநியோகம்", "🧾 பில் & ரசீதுகள்", "💵 செலுத்திய தொகைகள்", "📊 அறிக்கைகள்"]
+
+# Sidebar Menu & Logout Button
+with st.sidebar:
+    st.markdown(f"👤 **{t('User', 'பயனர்')}:** `{st.session_state.get('username', 'admin')}`")
+    if st.button(t("🚪 Logout", "🚪 வெளியேறு"), use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.rerun()
+    st.markdown("---")
 
 menu_selection = st.sidebar.radio("Menu / மெனு", menu_options_ta if st.session_state.app_lang == "தமிழ்" else menu_options_en)
 
@@ -69,33 +119,147 @@ else:
 
 item_rates = get_item_rates()
 
+# Helper for Date Range Selection
+def render_date_range_picker(key_prefix="dash"):
+    calc_mode = st.radio(
+        t("Calculation Mode / கணக்கீட்டு முறை", "Calculation Mode / கணக்கீட்டு முறை"),
+        [
+            t("📅 Single Day", "📅 ஒரு நாள் மட்டும்"),
+            t("🗓️ Full Month (1 to 30/31)", "🗓️ முழு மாதம் (1 முதல் 30/31 வரை)"),
+            t("📆 Custom Date Range", "📆 குறிப்பிட்ட தேதி வரம்பு")
+        ],
+        horizontal=True,
+        key=f"{key_prefix}_mode"
+    )
+    
+    today = date.today()
+    if "Single" in calc_mode or "ஒரு நாள்" in calc_mode:
+        selected_date = st.date_input(t("Select Date", "தேதியை தேர்ந்தெடுக்கவும்"), value=today, key=f"{key_prefix}_single_date")
+        s_date = selected_date.isoformat()
+        e_date = selected_date.isoformat()
+        period_label = selected_date.strftime("%d-%b-%Y")
+    elif "Full Month" in calc_mode or "முழு மாதம்" in calc_mode:
+        col_m, col_y = st.columns(2)
+        month_idx = col_m.selectbox(
+            t("Select Month", "மாதம்"),
+            list(range(1, 13)),
+            index=today.month - 1,
+            format_func=lambda m: datetime(2000, m, 1).strftime('%B'),
+            key=f"{key_prefix}_month_sel"
+        )
+        year_val = col_y.number_input(t("Select Year", "ஆண்டு"), min_value=2020, max_value=2035, value=today.year, key=f"{key_prefix}_year_sel")
+        last_day = calendar.monthrange(year_val, month_idx)[1]
+        
+        s_date = f"{year_val:04d}-{month_idx:02d}-01"
+        e_date = f"{year_val:04d}-{month_idx:02d}-{last_day:02d}"
+        period_label = f"01 to {last_day} {datetime(2000, month_idx, 1).strftime('%B')} {year_val}"
+    else:
+        col_s, col_e = st.columns(2)
+        s_val = col_s.date_input(t("From Date (e.g. 1st)", "தொடங்கும் தேதி (எ.கா. 1)"), value=today.replace(day=1), key=f"{key_prefix}_sdate")
+        e_val = col_e.date_input(t("To Date (e.g. 30th)", "முடிவடையும் தேதி (எ.கா. 30)"), value=today, key=f"{key_prefix}_edate")
+        s_date = s_val.isoformat()
+        e_date = e_val.isoformat()
+        period_label = f"{s_val.strftime('%d-%b-%Y')} to {e_val.strftime('%d-%b-%Y')}"
+
+    return s_date, e_date, period_label
+
 # ---------------- Dashboard ----------------
 if menu == "Dashboard":
-    st.subheader(t("Dashboard", "டாஷ்போர்டு"))
-    selected_date = st.date_input(t("Delivery date", "விநியோக தேதி"), value=date.today())
-    stats = get_dashboard_stats(selected_date.isoformat())
+    st.subheader(t("Dashboard Overview", "டாஷ்போர்டு மேலோட்டம்"))
+    
+    s_date, e_date, period_label = render_date_range_picker("dash")
+    st.info(f"📆 **{t('Selected Period:', 'தேர்ந்தெடுக்கப்பட்ட காலம்:')}** `{period_label}`")
+
+    stats = get_dashboard_stats(s_date, e_date)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(t("Active Customers", "செயலில் உள்ள வாடிக்கையாளர்கள்"), stats["customers"])
-    c2.metric(t("Delivered", "விநியோகிக்கப்பட்டவை"), stats["delivered"])
-    c3.metric(t("No Milk/Curd", "பால் இல்லை"), stats["no_milk"])
-    c4.metric(t("Today's Total Quantity", "இன்றைய மொத்த அளவு"), f'{stats["litres"]:.2f}')
+    c2.metric(t("Delivered Customers", "பால் பெற்றவர்கள்"), stats["delivered"])
+    c3.metric(t("No Milk Customers", "பால் வாங்காதவர்கள்"), stats["no_milk"])
+    c4.metric(t("Total Quantity (Pkts)", "மொத்த அளவு (பாக்கெட்டுகள்)"), f'{stats["litres"]:.2f}')
 
-    st.markdown(f'<div class="custom-banner">{t("🌟 Tip: You can switch between English and Tamil anytime using the toggle at the top right!", "🌟 குறிப்பு: மேலே உள்ள பட்டனைப் பயன்படுத்தி எப்போது வேண்டுமானாலும் தமிழ் மற்றும் ஆங்கிலத்திற்கு மாற்றிக் கொள்ளலாம்!")}</div>', unsafe_allow_html=True)
+    st.markdown("---")
+    # Financial Summary Metrics
+    f1, f2, f3 = st.columns(3)
+    f1.metric(t("Total Cost (₹)", "மொத்த வாங்கிய விலை (₹)"), f"₹{stats['total_cost']:,.2f}")
+    f2.metric(t("Total Revenue (₹)", "மொத்த விற்பனை (₹)"), f"₹{stats['total_sell']:,.2f}")
+    f3.metric(t("Net Profit Earned (₹)", "நிகர லாபம் (₹)"), f"₹{stats['profit']:,.2f}", delta=f"₹{stats['profit']:,.2f}")
+
+    st.markdown("---")
+    
+    # Tab layout for Brand Breakdown and Day-by-Day view
+    tab_brand, tab_daily = st.tabs([
+        t("🥛 Brand & Profit Breakdown", "🥛 பிராண்ட் மற்றும் லாப சுருக்கம்"),
+        t("📅 Day-by-Day (1 to 30/31) Calculation", "📅 நாள் வாரியான (1 முதல் 30/31) கணக்கீடு")
+    ])
+
+    with tab_brand:
+        breakdown = get_item_breakdown_by_date_range(s_date, e_date)
+        if breakdown:
+            table_data = []
+            for b in breakdown:
+                table_data.append({
+                    t("Product / Brand", "பொருள் / பிராண்ட்"): b["item_name"],
+                    t("Delivered Qty (Pkts)", "விநியோகிக்கப்பட்ட அளவு"): f"{b['delivered_qty']:g}",
+                    t("Total Cost (₹)", "மொத்த அடக்க விலை (₹)"): f"₹{b['total_cost']:,.2f}",
+                    t("Total Revenue (₹)", "மொத்த விற்பனை (₹)"): f"₹{b['total_sell']:,.2f}",
+                    t("Net Profit (₹)", "நிகர லாபம் (₹)"): f"₹{b['profit']:,.2f}"
+                })
+            st.dataframe(table_data, use_container_width=True)
+        else:
+            st.info(t("No deliveries recorded for this period.", "இந்த காலத்தில் விநியோக பதிவுகள் இல்லை."))
+
+    with tab_daily:
+        st.markdown(f"### 🗓 {t('Day-by-Day Breakdown for Selected Range', 'நாள் வாரியான விநியோக விபரம்')}")
+        daily_rows = get_daily_breakdown_by_date_range(s_date, e_date)
+        matrix = get_daily_brand_matrix(s_date, e_date)
+
+        if daily_rows:
+            daily_table = []
+            for row in daily_rows:
+                d = row["delivery_date"]
+                b_map = matrix.get(d, {})
+                
+                entry = {
+                    t("Date", "தேதி"): d,
+                    t("Delivered Cust", "பால் பெற்றவர்கள்"): row["delivered_cust"],
+                    t("Total Qty (Pkts)", "மொத்த அளவு"): f"{row['delivered_qty']:g}",
+                    t("Cost (₹)", "செலவு (₹)"): f"₹{row['total_cost']:,.2f}",
+                    t("Revenue (₹)", "விற்பனை (₹)"): f"₹{row['total_sell']:,.2f}",
+                    t("Profit (₹)", "லாபம் (₹)"): f"₹{row['profit']:,.2f}"
+                }
+                
+                for item in AVAILABLE_ITEMS:
+                    entry[item] = f"{b_map.get(item, 0.0):g}"
+                
+                daily_table.append(entry)
+
+            st.dataframe(daily_table, use_container_width=True)
+        else:
+            st.info(t("No day-by-day delivery records found for this period.", "தேர்ந்தெடுக்கப்பட்ட காலத்தில் நாள் வாரியான பதிவுகள் இல்லை."))
+
+    st.markdown(f'<div class="custom-banner">{t("🌟 Tip: Switch to Full Month mode to automatically calculate all days from 1 to 30/31!", "🌟 குறிப்பு: 1 முதல் 30/31 வரையிலான அனைத்து நாட்களையும் கணக்கிட முழு மாதம் முறையைத் தேர்ந்தெடுக்கவும்!")}</div>', unsafe_allow_html=True)
 
 # ---------------- Item Rates ----------------
 elif menu == "Item Rates":
-    st.subheader(t("Configure Product & Packet Rates (₹ per item/packet)", "பொருள் மற்றும் பாக்கெட் விலைகளை அமைக்குக (₹)"))
+    st.subheader(t("Configure Cost & Selling Prices (₹ per item/packet)", "பொருள் அடக்க மற்றும் விற்பனை விலைகளை அமைக்குக (₹)"))
+    
     with st.form("item_rates_form"):
         new_rates = {}
         for item in AVAILABLE_ITEMS:
-            new_rates[item] = st.number_input(f"{item} {t('Rate (₹)', 'விலை (₹)')}", min_value=0.0, value=float(item_rates.get(item, 30.0)), step=0.50)
+            curr_rates = item_rates.get(item, {"cost_price": 20.0, "sell_price": 25.0})
+            st.markdown(f"#### 🥛 {item}")
+            col_cp, col_sp = st.columns(2)
+            cp_val = col_cp.number_input(f"{t('Cost Price / Buying Price (₹)', 'அடக்க / வாங்கிய விலை (₹)')} - {item}", min_value=0.0, value=float(curr_rates["cost_price"]), step=0.50, key=f"cp_{item}")
+            sp_val = col_sp.number_input(f"{t('Selling Price (₹)', 'விற்பனை விலை (₹)')} - {item}", min_value=0.0, value=float(curr_rates["sell_price"]), step=0.50, key=f"sp_{item}")
+            new_rates[item] = {"cost_price": cp_val, "sell_price": sp_val}
+            st.markdown("---")
         
-        submitted = st.form_submit_button(t("Save Rates", "விலைகளை சேமிக்கவும்"))
+        submitted = st.form_submit_button(t("💾 Save Cost & Sell Rates", "💾 விலைகளை சேமிக்கவும்"), type="primary")
         if submitted:
-            for item, rate in new_rates.items():
-                set_item_rate(item, rate)
-            st.toast(t("✅ Item rates updated successfully!", "✅ பொருள் விலைகள் வெற்றிகரமாக புதுப்பிக்கப்பட்டன!"), icon="🎉")
-            st.success(t("Item rates updated successfully!", "பொருள் விலைகள் புதுப்பிக்கப்பட்டன!"))
+            for item, r in new_rates.items():
+                set_item_rate(item, r["cost_price"], r["sell_price"])
+            st.toast(t("✅ Cost & Selling rates updated successfully!", "✅ அடக்க & விற்பனை விலைகள் புதுப்பிக்கப்பட்டன!"), icon="🎉")
+            st.success(t("Rates updated successfully!", "விலைகள் புதுப்பிக்கப்பட்டன!"))
             st.rerun()
 
 # ---------------- Customers ----------------
@@ -207,7 +371,7 @@ elif menu == "Customers":
                         if remove:
                             if del_password == "1234":
                                 delete_customer(cid)
-                                st.toast(t("⚠️ Customer deleted!", "⚠️ வாடிக்கையாளர் நீக்கப்பட்டார்!"), icon="🗑️")
+                                st.toast(t("⚠️ Customer deleted!", "⚠ வாடிக்கையாளர் நீக்கப்பட்டார்!"), icon="🗑️")
                                 st.rerun()
                             else:
                                 st.error(t("❌ Incorrect password!", "❌ தவறான கடவுச்சொல்!"))
@@ -216,6 +380,7 @@ elif menu == "Customers":
 elif menu == "Daily Delivery":
     st.subheader(t("Daily Milk & Curd Delivery", "தினசரி பால் & தயிர் விநியோகம்"))
     delivery_date = st.date_input(t("Delivery date", "விநியோக தேதி"), value=date.today())
+    formatted_delivery_date = delivery_date.strftime("%d-%b-%Y")
     customers = get_customers(include_inactive=False)
 
     if not customers:
@@ -225,7 +390,10 @@ elif menu == "Daily Delivery":
         is_modification = len(existing_rows) > 0
 
         if is_modification:
-            st.markdown(f'<div class="warn-banner">{t(f"⚠️ Delivery records for {delivery_date.strftime("%d-%b-%Y")} already exist.", f"⚠️ {delivery_date.strftime("%d-%b-%Y")} தேதிக்கான விநியோக பதிவுகள் ஏற்கனவே உள்ளன.")}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="warn-banner">{t(f"⚠ Delivery records for {formatted_delivery_date} already exist.", f"⚠ {formatted_delivery_date} தேதிக்கான விநியோக பதிவுகள் ஏற்கனவே உள்ளன.")}</div>', 
+                unsafe_allow_html=True
+            )
             overwrite_confirm = st.checkbox(t("Yes, I want to modify/update today's delivery records", "ஆம், இன்றைய பதிவுகளை மாற்றியமைக்க விரும்புகிறேன்"), value=True)
         else:
             overwrite_confirm = True
@@ -263,7 +431,7 @@ elif menu == "Daily Delivery":
                     item_def_idx = AVAILABLE_ITEMS.index(row_data["item"]) if row_data["item"] in AVAILABLE_ITEMS else 0
                     item_sel = col1.selectbox(t("Product", "பொருள்"), AVAILABLE_ITEMS, index=item_def_idx, key=f"d_item_{cid}_{idx}")
                     qty_inp = col2.number_input(t("Qty", "அளவு"), min_value=0.0, max_value=100.0, value=float(row_data["qty"]), step=1.0, key=f"d_qty_{cid}_{idx}")
-                    status_sel = col3.selectbox(t("Status", "நிலை"), [t("Delivered", "Delivered"), t("No Milk", "No Milk")], index=0 if row_data["status"]=="Delivered" else 1, key=f"d_stat_{cid}_{idx}")
+                    status_sel = col3.selectbox(t("Status", "நிலை"), [t("Delivered", "Delivered"), t("No Milk", "No Milk")], index=0 if row_data["status"] in ["Delivered", "விநியோகிக்கப்பட்டது"] else 1, key=f"d_stat_{cid}_{idx}")
                     note_inp = col4.text_input(t("Note", "குறிப்பு"), value=row_data["note"], key=f"d_note_{cid}_{idx}")
                     
                     actual_status = "Delivered" if status_sel in ["Delivered", t("Delivered", "Delivered")] else "No Milk"
@@ -293,10 +461,14 @@ elif menu == "Daily Delivery":
                     for itm in items:
                         stat = "No Milk" if itm["qty"] <= 0 else itm["status"]
                         q = 0.0 if stat == "No Milk" else itm["qty"]
-                        rate = item_rates.get(itm["item"], 30.0)
-                        save_delivery(cid, delivery_date.isoformat(), itm["item"], q, rate, stat, itm["note"])
+                        
+                        r_info = item_rates.get(itm["item"], {"cost_price": 20.0, "sell_price": 25.0})
+                        cost_rate = r_info["cost_price"]
+                        sell_rate = r_info["sell_price"]
+                        
+                        save_delivery(cid, delivery_date.isoformat(), itm["item"], q, cost_rate, sell_rate, stat, itm["note"])
 
-                st.toast(t(f"✅ Delivery saved for {delivery_date.strftime('%d-%b-%Y')}!", f"✅ {delivery_date.strftime('%d-%b-%Y')} விநியோகம் சேமிக்கப்பட்டது!"), icon="🎉")
+                st.toast(t(f"✅ Delivery saved for {formatted_delivery_date}!", f"✅ {formatted_delivery_date} விநியோகம் சேமிக்கப்பட்டது!"), icon="🎉")
                 st.rerun()
 
 # ---------------- Billing & Receipts ----------------
@@ -312,7 +484,7 @@ elif menu == "Billing & Receipts":
         tab_indiv, tab_bulk, tab_print = st.tabs([
             t("👤 Individual Customer Receipt", "👤 தனிநபர் ரசீது"), 
             t("📋 Bulk WhatsApp Queue", "📋 மொத்த வாட்ஸ்அப் வரிசை"), 
-            t("🖨️ Printable A4 Bill Slips", "🖨️ பிரிண்ட் A4 பில் ஸ்லிப்புகள்")
+            t("🖨 Printable A4 Bill Slips", "🖨️ பிரிண்ட் A4 பில் ஸ்லிப்புகள்")
         ])
 
         with tab_indiv:
@@ -334,7 +506,7 @@ elif menu == "Billing & Receipts":
                 qty = r[4]
                 rate = r[5]
                 status = r[6]
-                if status == "Delivered" and qty > 0:
+                if status in ["Delivered", "விநியோகிக்கப்பட்டது"] and qty > 0:
                     if item_name not in item_breakdown:
                         item_breakdown[item_name] = {"total_qty": 0.0, "days": 0, "rate": rate}
                     item_breakdown[item_name]["total_qty"] += qty
@@ -342,10 +514,12 @@ elif menu == "Billing & Receipts":
 
             phone = customer_info[2]
             if phone:
-                clean_phone = "".join(filter(str.isdigit, phone))
+                clean_phone = "".join(filter(str.isdigit, str(phone)))
                 if len(clean_phone) == 10:
                     clean_phone = "91" + clean_phone
-                
+                elif len(clean_phone) == 11 and clean_phone.startswith("0"):
+                    clean_phone = "91" + clean_phone[1:]
+
                 st.markdown(f"### 💬 {t('WhatsApp Text Message', 'வாட்ஸ்அப் குறுஞ்செய்தி')}")
                 
                 if st.session_state.app_lang == "தமிழ்":
@@ -365,7 +539,7 @@ elif menu == "Billing & Receipts":
                         f"--------------------------------\n"
                         f"💡 *பணம் செலுத்த (Payment Notice):*\n"
                         f"தயவுசெய்து GPay / UPI மூலம் பணம் செலுத்தவும், ரொக்கப் பரிவர்த்தனையைத் தவிர்க்கவும்: 9489002466 (பேச்சிமுத்து). செலுத்திய ரசீதை எங்களுக்கு அனுப்பவும்.\n\n"
-                        f"• நஞ்சில் 250 மி.லி (Red) பால் ₹22 கிடைக்கும்.\n"
+                        f"• நஞ்சில் (Red) பால் கிடைக்கும்.\n"
                         f"• ஆவின் தயிர் கிடைக்கும்.\n"
                         f"• திருமண விழாக்கள் மற்றும் விசேஷங்களுக்கு பால் வீடு தேடி விநியோகம் செய்யப்படும் (24 மணி நேரத்திற்கு முன் முன்பதிவு தேவை).\n"
                         f"தொடர்புக்கு: 8838594492 / 9489002466\n\n"
@@ -388,7 +562,7 @@ elif menu == "Billing & Receipts":
                         f"--------------------------------\n"
                         f"💡 *Payment Notice:*\n"
                         f"Please pay using GPay / UPI, avoid cash transactions: 9489002466 (Pechimuthu). Kindly share your payment receipt with us.\n\n"
-                        f"• Nanjil 250 ml (Red) Milk ₹22 available.\n"
+                        f"• Nanjil Red Milk available.\n"
                         f"• Aavin Curd available.\n"
                         f"• Milk door delivery available for marriages & special functions (24-hour advance booking required).\n"
                         f"Contact: 8838594492 / 9489002466\n\n"
@@ -396,8 +570,9 @@ elif menu == "Billing & Receipts":
                     )
 
                 st.text_area(t("Preview WhatsApp Message", "வாட்ஸ்அப் முன்னோட்டம்"), value=wa_text, height=290, key="preview_wa")
-                encoded_wa = urllib.parse.quote(wa_text)
-                st.link_button(t("💬 Send Bill via WhatsApp", "💬 வாட்ஸ்அப் மூலம் பில் அனுப்பவும்"), f"https://wa.me/{clean_phone}?text={encoded_wa}", use_container_width=True)
+                encoded_wa = urllib.parse.quote(wa_text, safe='')
+                wa_url = f"https://api.whatsapp.com/send?phone={clean_phone}&text={encoded_wa}"
+                st.link_button(t("💬 Send Bill via WhatsApp", "💬 வாட்ஸ்அப் மூலம் பில் அனுப்பவும்"), wa_url, use_container_width=True)
             else:
                 st.warning(t("⚠️ No phone number saved for this customer.", "⚠️ இந்த வாடிக்கையாளருக்கு தொலைபேசி எண் இல்லை."))
 
@@ -429,7 +604,7 @@ elif menu == "Billing & Receipts":
             p_pay_notice = t("💡 Payment Notice:", "💡 பணம் செலுத்த (Payment Notice):")
             p_pay_desc = t("Please pay using GPay / UPI and avoid cash transactions: <b>9489002466</b> (Pechimuthu). Please share payment receipt with us.", 
                            "தயவுசெய்து GPay / UPI மூலம் பணம் செலுத்தவும், ரொக்கப் பரிவர்த்தனையைத் தவிர்க்கவும்: <b>9489002466</b> (பேச்சிமுத்து). பணம் செலுத்திய பின் ரசீதை எங்களுக்கு அனுப்பவும்.")
-            p_note1 = t("Nanjil 250 ml (Red) Milk ₹22 available.", "நஞ்சில் 250 மி.லி (Red) பால் ₹22 கிடைக்கும்.")
+            p_note1 = t("Nanjil Red Milk available.", "நஞ்சில் (Red) பால் கிடைக்கும்.")
             p_note2 = t("Aavin Curd available.", "ஆவின் தயிர் கிடைக்கும்.")
             p_note3 = t("Milk door delivery available for marriages & special functions (24-hour booking required).", "திருமண விழாக்கள் மற்றும் விசேஷங்களுக்கு பால் வீடு தேடி விநியோகம் செய்யப்படும் (24 மணி நேரத்திற்கு முன் முன்பதிவு தேவை).")
             p_contact = t("Contact:", "தொடர்புக்கு:")
@@ -492,7 +667,7 @@ elif menu == "Billing & Receipts":
             st.markdown(f"### 📥 {t('Bulk Download', 'மொத்த பதிவிறக்கம்')}")
             all_csv_data = export_all_customers_monthly_report_csv(month_key)
             st.download_button(
-                label=t("⬇️ Download All Customers Monthly Report (CSV)", "⬇️ அனைத்து வாடிக்கையாளர்கள் மாதாந்திர அறிக்கை (CSV)"),
+                label=t("⬇️ Download All Customers Monthly Report (CSV)", "⬇ அனைத்து வாடிக்கையாளர்கள் மாதாந்திர அறிக்கை (CSV)"),
                 data=all_csv_data,
                 file_name=f"all_customers_milk_report_{month_key}.csv",
                 mime="text/csv",
@@ -524,7 +699,7 @@ elif menu == "Billing & Receipts":
                             qty = r[4]
                             rate = r[5]
                             status = r[6]
-                            if status == "Delivered" and qty > 0:
+                            if status in ["Delivered", "விநியோகிக்கப்பட்டது"] and qty > 0:
                                 if item_name not in cust_item_breakdown:
                                     cust_item_breakdown[item_name] = {"total_qty": 0.0, "days": 0, "rate": rate}
                                 cust_item_breakdown[item_name]["total_qty"] += qty
@@ -573,7 +748,7 @@ elif menu == "Payments":
         selected_month = st.date_input(t("Billing month", "பில் மாதம்"), value=date.today())
         month_key = selected_month.strftime("%Y-%m")
         options = {f"{c[1]}": c[0] for c in customers}
-        selected = st.selectbox(t("Customer", "வாடிக்கையாளர்"), list(options.keys()))
+        selected = st.selectbox(t("Customer", "வாடிக்கையாளரை தேர்ந்தெடுக்கவும்"), list(options.keys()))
         cid = options[selected]
         summary = get_monthly_summary(cid, month_key)
         payments = get_payments(cid, month_key)
@@ -597,15 +772,102 @@ elif menu == "Payments":
 
 # ---------------- Reports ----------------
 elif menu == "Reports":
-    st.subheader(t("Reports & Export", "அறிக்கைகள் & பதிவிறக்கம்"))
-    report_date = st.date_input(t("Report Date", "அறிக்கை தேதி"), value=date.today())
-    stats = get_dashboard_stats(report_date.isoformat())
-    c1, c2, c3 = st.columns(3)
-    c1.metric(t("Delivered Customers", "பால் விநியோகிக்கப்பட்டவர்கள்"), stats["delivered"])
-    c2.metric(t("No Milk/Curd", "பால் இல்லை"), stats["no_milk"])
-    c3.metric(t("Total Quantity", "மொத்த அளவு"), f'{stats["litres"]:.2f}')
+    st.subheader(t("Reports & Analytics", "அறிக்கைகள் & பகுப்பாய்வு"))
+    
+    s_date, e_date, period_label = render_date_range_picker("rep")
+    st.info(f"📆 **{t('Selected Period:', 'தேர்ந்தெடுக்கப்பட்ட காலம்:')}** `{period_label}`")
 
-    st.markdown(f"### {t('Export Data', 'தரவு பதிவிறக்கம்')}")
-    col1, col2 = st.columns(2)
-    col1.download_button(t("⬇️ Export Customers CSV", "⬇️ வாடிக்கையாளர்கள் CSV"), export_customers_csv(), "customers.csv", "text/csv")
-    col2.download_button(t("⬇️ Export Deliveries CSV", "⬇️ விநியோகங்கள் CSV"), export_deliveries_csv(), "deliveries.csv", "text/csv")
+    # Item/Brand Breakdown
+    st.markdown(f"### 📊 {t('Brand & Profit Summary', 'பிராண்ட் மற்றும் லாப சுருக்கம்')}")
+    breakdown = get_item_breakdown_by_date_range(s_date, e_date)
+    if breakdown:
+        table_data = []
+        total_del_qty = 0
+        total_undel_cnt = 0
+        total_cost = 0.0
+        total_sell = 0.0
+        total_profit = 0.0
+        
+        for b in breakdown:
+            total_del_qty += b["delivered_qty"]
+            total_undel_cnt += b["undelivered_count"]
+            total_cost += b["total_cost"]
+            total_sell += b["total_sell"]
+            total_profit += b["profit"]
+            
+            table_data.append({
+                t("Product / Brand", "பொருள் / பிராண்ட்"): b["item_name"],
+                t("Delivered Quantity", "விநியோகிக்கப்பட்ட அளவு"): f"{b['delivered_qty']:g}",
+                t("Not Delivered Count", "பால் வாங்காத எண்ணிக்கை"): b["undelivered_count"],
+                t("Total Cost (₹)", "மொத்த அடக்க விலை (₹)"): f"₹{b['total_cost']:,.2f}",
+                t("Total Revenue (₹)", "மொத்த விற்பனை தொகை (₹)"): f"₹{b['total_sell']:,.2f}",
+                t("Net Profit (₹)", "நிகர லாபம் (₹)"): f"₹{b['profit']:,.2f}"
+            })
+        
+        st.dataframe(table_data, use_container_width=True)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(t("Total Quantity Delivered", "மொத்த விநியோக அளவு"), f"{total_del_qty:g}")
+        m2.metric(t("Total Cost (₹)", "மொத்த அடக்க விலை (₹)"), f"₹{total_cost:,.2f}")
+        m3.metric(t("Total Revenue (₹)", "மொத்த வருவாய் (₹)"), f"₹{total_sell:,.2f}")
+        m4.metric(t("Net Profit (₹)", "நிகர லாபம் (₹)"), f"₹{total_profit:,.2f}", delta=f"₹{total_profit:,.2f}")
+    else:
+        st.info(t("No delivery records found for the selected period.", "தேர்ந்தெடுக்கப்பட்ட காலத்தில் விநியோக பதிவுகள் இல்லை."))
+
+    st.markdown("---")
+    
+    # Day-by-Day Table
+    st.markdown(f"### 📅 {t('Day-by-Day Breakdown (1 to 30/31)', 'நாள் வாரியான கணக்கீடு (1 முதல் 30/31 வரை)')}")
+    daily_rows = get_daily_breakdown_by_date_range(s_date, e_date)
+    matrix = get_daily_brand_matrix(s_date, e_date)
+
+    if daily_rows:
+        daily_table = []
+        for row in daily_rows:
+            d = row["delivery_date"]
+            b_map = matrix.get(d, {})
+            
+            entry = {
+                t("Date", "தேதி"): d,
+                t("Delivered Cust", "பால் பெற்றவர்கள்"): row["delivered_cust"],
+                t("No Milk Cust", "பால் வாங்காதவர்கள்"): row["undelivered_cust"],
+                t("Total Delivered Qty", "மொத்த அளவு"): f"{row['delivered_qty']:g}",
+                t("Total Cost (₹)", "மொத்த செலவு (₹)"): f"₹{row['total_cost']:,.2f}",
+                t("Total Revenue (₹)", "மொத்த வருவாய் (₹)"): f"₹{row['total_sell']:,.2f}",
+                t("Profit (₹)", "லாபம் (₹)"): f"₹{row['profit']:,.2f}"
+            }
+            
+            for item in AVAILABLE_ITEMS:
+                entry[item] = f"{b_map.get(item, 0.0):g}"
+            
+            daily_table.append(entry)
+
+        st.dataframe(daily_table, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown(f"### 📥 {t('Export Reports & Summaries', 'அறிக்கைகள் பதிவிறக்கம்')}")
+    col_ex1, col_ex2, col_ex3 = st.columns(3)
+    
+    range_csv = export_range_deliveries_csv(s_date, e_date)
+    col_ex1.download_button(
+        t("⬇️ Export Detailed Deliveries CSV", "⬇️ விரிவான விநியோகங்கள் CSV"),
+        data=range_csv,
+        file_name=f"deliveries_{s_date}_to_{e_date}.csv",
+        mime="text/csv",
+        type="primary"
+    )
+
+    daily_summary_csv = export_daily_summary_csv(s_date, e_date)
+    col_ex2.download_button(
+        t("⬇️ Export Day-by-Day Summary CSV", "⬇️ நாள் வாரியான சுருக்கம் CSV"),
+        data=daily_summary_csv,
+        file_name=f"daily_summary_{s_date}_to_{e_date}.csv",
+        mime="text/primary"
+    )
+    
+    col_ex3.download_button(
+        t("⬇️ Export Master Customers CSV", "⬇️ அனைத்து வாடிக்கையாளர்கள் மாஸ்டர் CSV"),
+        data=export_customers_csv(),
+        file_name="customers_list.csv",
+        mime="text/csv"
+    )
