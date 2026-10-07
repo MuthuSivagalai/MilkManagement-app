@@ -6,7 +6,7 @@ import urllib.parse
 from database import (
     init_db, AVAILABLE_ITEMS, get_item_rates, set_item_rate, add_customer, update_customer,
     delete_customer, get_customers, get_customer, get_customer_items, save_delivery, clear_deliveries_for_date,
-    get_customer_deliveries_for_date, get_deliveries, get_monthly_summary, add_payment, get_payments,
+    get_customer_deliveries_for_date, get_customer_deliveries_by_date_range, get_deliveries, get_monthly_summary, add_payment, get_payments,
     get_dashboard_stats, export_deliveries_csv, export_customers_csv, export_all_customers_monthly_report_csv,
     get_item_breakdown_by_date_range, get_daily_breakdown_by_date_range, get_daily_brand_matrix,
     export_range_deliveries_csv, export_daily_summary_csv
@@ -519,7 +519,6 @@ elif menu == "Daily Delivery":
         d_state = st.session_state[daily_state_key]
         form_data = {}
 
-        # Render customers compactly in a streamlined grid/card layout
         for c in customers:
             cid, name, phone, address, active, created = c
             
@@ -540,7 +539,6 @@ elif menu == "Daily Delivery":
                 updated_rows = []
                 
                 for idx, row_data in enumerate(rows_for_cust):
-                    # Compact horizontal layout per item row to eliminate vertical scrolling
                     c_it, c_qt, c_st, c_nt, c_rm = st.columns([2.5, 1.2, 1.5, 2.3, 0.5])
                     
                     item_def_idx = AVAILABLE_ITEMS.index(row_data["item"]) if row_data["item"] in AVAILABLE_ITEMS else 0
@@ -888,6 +886,42 @@ elif menu == "Reports":
     s_date, e_date, period_label = render_date_range_picker("rep")
     st.info(f"📆 **{t('Selected Period:', 'தேர்ந்தெடுக்கப்பட்ட காலம்:')}** `{period_label}`")
 
+    # --- Customer-wise Daily Report Section ---
+    st.markdown("---")
+    st.markdown(f"### 👤 {t('Customer-wise Daily Delivery Report', 'வாடிக்கையாளர் வாரியான தினசரி விநியோக அறிக்கை')}")
+    customers_all = get_customers(include_inactive=True)
+    if customers_all:
+        cust_options = {f"{c[1]} ({c[2] or 'No phone'})": c[0] for c in customers_all}
+        selected_cust_label = st.selectbox(t("Select Customer for Daily Report", "தினசரி அறிக்கைக்கான வாடிக்கையாளரை தேர்ந்தெடுக்கவும்"), list(cust_options.keys()), key="rep_cust_sel")
+        selected_cust_id = cust_options[selected_cust_label]
+        
+        cust_delivs = get_customer_deliveries_by_date_range(selected_cust_id, s_date, e_date)
+        if cust_delivs:
+            cust_report_table = []
+            tot_cust_qty = 0.0
+            tot_cust_rev = 0.0
+            for d_row in cust_delivs:
+                sub_rev = d_row["quantity"] * d_row["rate"]
+                tot_cust_qty += d_row["quantity"]
+                tot_cust_rev += sub_rev
+                cust_report_table.append({
+                    t("Date", "தேதி"): d_row["delivery_date"],
+                    t("Product / Brand", "பொருள் / பிராண்ட்"): d_row["item_name"],
+                    t("Quantity", "அளவு"): f"{d_row['quantity']:g}",
+                    t("Status", "நிலை"): d_row["status"],
+                    t("Rate (₹)", "விலை (₹)"): f"₹{d_row['rate']:.2f}",
+                    t("Total Amount (₹)", "மொத்த தொகை (₹)"): f"₹{sub_rev:,.2f}",
+                    t("Note", "குறிப்பு"): d_row["note"]
+                })
+            st.dataframe(cust_report_table, use_container_width=True)
+            
+            c_m1, c_m2 = st.columns(2)
+            c_m1.metric(t("Total Quantity Delivered", "மொத்த விநியோக அளவு"), f"{tot_cust_qty:g}")
+            c_m2.metric(t("Total Revenue (₹)", "மொத்த வருவாய் (₹)"), f"₹{tot_cust_rev:,.2f}")
+        else:
+            st.info(t("No delivery records found for this customer in the selected period.", "தேர்ந்தெடுக்கப்பட்ட காலத்தில் இந்த வாடிக்கையாளருக்கு விநியோக பதிவுகள் இல்லை."))
+
+    st.markdown("---")
     st.markdown(f"### 📊 {t('Brand & Profit Summary', 'பிராண்ட் மற்றும் லாப சுருக்கம்')}")
     breakdown = get_item_breakdown_by_date_range(s_date, e_date)
     if breakdown:
