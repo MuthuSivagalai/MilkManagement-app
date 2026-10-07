@@ -34,14 +34,97 @@ if "app_lang" not in st.session_state:
 def t(en_text, ta_text):
     return ta_text if st.session_state.get("app_lang", "English") == "தமிழ்" else en_text
 
+# ---------------- Vibrant Custom CSS Styling (Optimized & Compact) ----------------
+st.markdown("""
+<style>
+/* Global App Styling & Font */
+.stApp {
+    background: linear-gradient(135deg, #f0f4f8 0%, #d9e2ec 100%);
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+/* Main Title & Headers */
+.main-title {
+    font-size: 30px; 
+    font-weight: 800; 
+    background: linear-gradient(90deg, #4f46e5 0%, #06b6d4 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0px;
+}
+
+/* Custom Colorful Banners */
+.custom-banner {
+    padding: 10px 16px; 
+    border-radius: 10px; 
+    background: linear-gradient(135deg, #0d9488, #10b981); 
+    color: white; 
+    font-weight: 600; 
+    font-size: 14px;
+    margin-bottom: 12px;
+    box-shadow: 0 4px 12px rgba(13, 148, 136, 0.2);
+}
+
+.warn-banner {
+    padding: 10px 16px; 
+    border-radius: 10px; 
+    background: linear-gradient(135deg, #f43f5e, #fb7185); 
+    color: white; 
+    font-weight: 600; 
+    font-size: 14px;
+    margin-bottom: 12px;
+    box-shadow: 0 4px 12px rgba(244, 63, 94, 0.2);
+}
+
+/* Login Header */
+.login-header { 
+    text-align: center; 
+    margin-top: 15px; 
+    font-weight: 800;
+    color: #4f46e5;
+}
+
+/* Compact Container Styling for Delivery */
+div.delivery-card {
+    background: #ffffff;
+    border-radius: 10px;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+    border: 1px solid #e2e8f0;
+}
+
+/* Reduce default spacing in Streamlit to compact screens */
+.block-container {
+    padding-top: 2rem;
+    padding-bottom: 2rem;
+}
+
+/* Buttons Styling */
+.stButton>button {
+    border-radius: 8px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+
+.stButton>button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+
+/* Print Overrides */
+@media print {
+    body { background: white; color: black; margin: 0; padding: 0; }
+    .no-print { display: none !important; }
+    header, footer { visibility: hidden !important; display: none !important; }
+    .stSidebar { display: none !important; }
+    .printable-page { page-break-after: always; page-break-inside: avoid; break-inside: avoid; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ---------------- Login Screen ----------------
 if not st.session_state["authenticated"]:
-    st.markdown("""
-    <style>
-    .login-header { text-align: center; margin-top: 30px; font-weight: bold; }
-    </style>
-    """, unsafe_allow_html=True)
-    
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.markdown(f'<h2 class="login-header">{t("🔐 Login to Delivery System", "🔐 விநியோக அமைப்பில் உள்நுழைக")}</h2>', unsafe_allow_html=True)
@@ -61,23 +144,6 @@ if not st.session_state["authenticated"]:
                     st.error(t("❌ Invalid Username or Password", "❌ தவறான பயனர் பெயர் அல்லது கடவுச்சொல்"))
     st.stop()
 
-# ---------------- Custom CSS ----------------
-st.markdown("""
-<style>
-.main-title {font-size: 32px; font-weight: bold;}
-.custom-banner {padding: 12px 20px; border-radius: 8px; background: linear-gradient(90deg, #4CAF50, #2E7D32); color: white; font-weight: 600; margin-bottom: 15px;}
-.warn-banner {padding: 12px 20px; border-radius: 8px; background: linear-gradient(90deg, #FF9800, #EF6C00); color: white; font-weight: 600; margin-bottom: 15px;}
-
-@media print {
-    body { background: white; color: black; margin: 0; padding: 0; }
-    .no-print { display: none !important; }
-    header, footer { visibility: hidden !important; display: none !important; }
-    .stSidebar { display: none !important; }
-    .printable-page { page-break-after: always; page-break-inside: avoid; break-inside: avoid; }
-}
-</style>
-""", unsafe_allow_html=True)
-
 # Top Bar Header with Language Selector
 top_col1, top_col2 = st.columns([3, 1])
 with top_col1:
@@ -88,7 +154,7 @@ with top_col1:
 with top_col2:
     st.radio("🌐 Language / மொழி", ["English", "தமிழ்"], key="app_lang", horizontal=True)
 
-menu_options_en = ["🏠 Dashboard", "⚙️️ Item Rates", "👥 Customers", "🥛 Daily Delivery", "🧾 Billing & Receipts", "💵 Payments", "📊 Reports"]
+menu_options_en = ["🏠 Dashboard", "⚙ Item Rates", "👥 Customers", "🥛 Daily Delivery", "🧾 Billing & Receipts", "💵 Payments", "📊 Reports"]
 menu_options_ta = ["🏠 டாஷ்போர்டு", "⚙️ பொருள் விலைகள்", "👥 வாடிக்கையாளர்கள்", "🥛 தினசரி விநியோகம்", "🧾 பில் & ரசீதுகள்", "💵 செலுத்திய தொகைகள்", "📊 அறிக்கைகள்"]
 
 # Sidebar Menu & Logout Button
@@ -178,7 +244,6 @@ if menu == "Dashboard":
     c4.metric(t("Total Quantity (Pkts)", "மொத்த அளவு (பாக்கெட்டுகள்)"), f'{stats["litres"]:.2f}')
 
     st.markdown("---")
-    # Financial Summary Metrics
     f1, f2, f3 = st.columns(3)
     f1.metric(t("Total Cost (₹)", "மொத்த வாங்கிய விலை (₹)"), f"₹{stats['total_cost']:,.2f}")
     f2.metric(t("Total Revenue (₹)", "மொத்த விற்பனை (₹)"), f"₹{stats['total_sell']:,.2f}")
@@ -186,7 +251,6 @@ if menu == "Dashboard":
 
     st.markdown("---")
     
-    # Tab layout for Brand Breakdown and Day-by-Day view
     tab_brand, tab_daily = st.tabs([
         t("🥛 Brand & Profit Breakdown", "🥛 பிராண்ட் மற்றும் லாப சுருக்கம்"),
         t("📅 Day-by-Day (1 to 30/31) Calculation", "📅 நாள் வாரியான (1 முதல் 30/31) கணக்கீடு")
@@ -244,18 +308,59 @@ elif menu == "Item Rates":
     st.subheader(t("Configure Cost & Selling Prices (₹ per item/packet)", "பொருள் அடக்க மற்றும் விற்பனை விலைகளை அமைக்குக (₹)"))
     
     with st.form("item_rates_form"):
-        st.markdown('<div style="max-height: 65vh; overflow-y: auto; padding-right: 10px;">', unsafe_allow_html=True)
         new_rates = {}
-        for item in AVAILABLE_ITEMS:
-            curr_rates = item_rates.get(item, {"cost_price": 20.0, "sell_price": 25.0})
-            st.markdown(f"#### 🥛 {item}")
-            col_cp, col_sp = st.columns(2)
-            cp_val = col_cp.number_input(f"{t('Cost Price / Buying Price (₹)', 'அடக்க / வாங்கிய விலை (₹)')} - {item}", min_value=0.0, value=float(curr_rates["cost_price"]), step=0.50, key=f"cp_{item}")
-            sp_val = col_sp.number_input(f"{t('Selling Price (₹)', 'விற்பனை விலை (₹)')} - {item}", min_value=0.0, value=float(curr_rates["sell_price"]), step=0.50, key=f"sp_{item}")
-            new_rates[item] = {"cost_price": cp_val, "sell_price": sp_val}
-            st.markdown("---")
         
-        submitted = st.form_submit_button(t("💾 Save Cost & Sell Rates", "💾 விலைகளை சேமிக்கவும்"), type="primary")
+        custom_pairs = [
+            ("Aavin Milk (250ml)", "Aavin Milk (Shop) (250ml)"),
+            ("Aavin Milk (500ml)", "Aavin Milk (Shop) (500ml)"),
+            ("Aavin Curd (100ml)", "Aavin Curd (Shop) (100ml)"),
+            ("Nanjil Milk Red (130ml)", "Nanjil Milk Red (Shop) (130ml)"),
+            ("Nanjil Milk Red (500ml)", "Nanjil Milk Red (Shop) (500ml)"),
+            ("Nanjil Milk Red (1 Litre)", "Nanjil Milk Red (Shop) (1 Litre)"),
+            ("Nanjil Green Milk (500ml)", "Nanjil Green Milk (Shop) (500ml)"),
+            ("Nanjil Green Milk (1 Litre)", "Nanjil Green Milk (Shop) (1 Litre)"),
+        ]
+        
+        ordered_items = []
+        added_set = set()
+        for p1, p2 in custom_pairs:
+            if p1 in AVAILABLE_ITEMS and p1 not in added_set:
+                ordered_items.append(p1)
+                added_set.add(p1)
+            if p2 in AVAILABLE_ITEMS and p2 not in added_set:
+                ordered_items.append(p2)
+                added_set.add(p2)
+                
+        for item in AVAILABLE_ITEMS:
+            if item not in added_set:
+                ordered_items.append(item)
+                added_set.add(item)
+        
+        for i in range(0, len(ordered_items), 2):
+            cols = st.columns(2)
+            
+            item1 = ordered_items[i]
+            curr_rates1 = item_rates.get(item1, {"cost_price": 20.0, "sell_price": 25.0})
+            with cols[0]:
+                st.markdown(f"🥛 **{item1}**")
+                c1, c2 = st.columns(2)
+                cp1 = c1.number_input(t("Cost (₹)", "அடக்க (₹)"), min_value=0.0, value=float(curr_rates1["cost_price"]), step=0.50, key=f"cp_{item1}")
+                sp1 = c2.number_input(t("Sell (₹)", "விற்பனை (₹)"), min_value=0.0, value=float(curr_rates1["sell_price"]), step=0.50, key=f"sp_{item1}")
+                new_rates[item1] = {"cost_price": cp1, "sell_price": sp1}
+            
+            if i + 1 < len(ordered_items):
+                item2 = ordered_items[i + 1]
+                curr_rates2 = item_rates.get(item2, {"cost_price": 20.0, "sell_price": 25.0})
+                with cols[1]:
+                    st.markdown(f"🏪 **{item2}**")
+                    c3, c4 = st.columns(2)
+                    cp2 = c3.number_input(t("Cost (₹)", "அடக்க (₹)"), min_value=0.0, value=float(curr_rates2["cost_price"]), step=0.50, key=f"cp_{item2}")
+                    sp2 = c4.number_input(t("Sell (₹)", "விற்பனை (₹)"), min_value=0.0, value=float(curr_rates2["sell_price"]), step=0.50, key=f"sp_{item2}")
+                    new_rates[item2] = {"cost_price": cp2, "sell_price": sp2}
+            
+            st.markdown("<hr style='margin: 5px 0; border: 0; border-top: 1px solid #ddd;'>", unsafe_allow_html=True)
+
+        submitted = st.form_submit_button(t("💾 Save Cost & Sell Rates", "💾 விலைகளை சேமிக்கவும்"), type="primary", use_container_width=True)
         if submitted:
             for item, r in new_rates.items():
                 set_item_rate(item, r["cost_price"], r["sell_price"])
@@ -377,11 +482,15 @@ elif menu == "Customers":
                             else:
                                 st.error(t("❌ Incorrect password!", "❌ தவறான கடவுச்சொல்!"))
 
-# ---------------- Daily Delivery ----------------
+# ---------------- Daily Delivery (Optimized Compact View) ----------------
 elif menu == "Daily Delivery":
     st.subheader(t("Daily Milk & Curd Delivery", "தினசரி பால் & தயிர் விநியோகம்"))
-    delivery_date = st.date_input(t("Delivery date", "விநியோக தேதி"), value=date.today())
+    
+    col_date, col_info = st.columns([2, 3])
+    with col_date:
+        delivery_date = st.date_input(t("Delivery date", "விநியோக தேதி"), value=date.today())
     formatted_delivery_date = delivery_date.strftime("%d-%b-%Y")
+    
     customers = get_customers(include_inactive=False)
 
     if not customers:
@@ -390,24 +499,27 @@ elif menu == "Daily Delivery":
         existing_rows = get_deliveries(None, delivery_date.isoformat())
         is_modification = len(existing_rows) > 0
 
-        if is_modification:
-            st.markdown(
-                f'<div class="warn-banner">{t(f"⚠ Delivery records for {formatted_delivery_date} already exist.", f"⚠ {formatted_delivery_date} தேதிக்கான விநியோக பதிவுகள் ஏற்கனவே உள்ளன.")}</div>', 
-                unsafe_allow_html=True
-            )
-            overwrite_confirm = st.checkbox(t("Yes, I want to modify/update today's delivery records", "ஆம், இன்றைய பதிவுகளை மாற்றியமைக்க விரும்புகிறேன்"), value=True)
-        else:
-            overwrite_confirm = True
+        with col_info:
+            if is_modification:
+                st.markdown(
+                    f'<div class="warn-banner" style="margin-top: 25px;">{t(f"⚠ Records for {formatted_delivery_date} exist.", f"⚠ {formatted_delivery_date} பதிவுகள் உள்ளன.")}</div>', 
+                    unsafe_allow_html=True
+                )
+                overwrite_confirm = st.checkbox(t("Modify existing records", "இன்றைய பதிவுகளை மாற்றியமைக்க"), value=True)
+            else:
+                st.markdown(f'<div class="custom-banner" style="margin-top: 25px;">📅 {formatted_delivery_date}</div>', unsafe_allow_html=True)
+                overwrite_confirm = True
 
-        st.markdown(f"### {t('Today\'s Customers', 'இன்றைய வாடிக்கையாளர்கள்')}")
+        st.markdown(f"### {t('Customers Quick Entry', 'வாடிக்கையாளர் விரைவு பதிவு')} ({len(customers)})")
 
         daily_state_key = f"daily_rows_{delivery_date.isoformat()}"
         if daily_state_key not in st.session_state:
             st.session_state[daily_state_key] = {}
 
         d_state = st.session_state[daily_state_key]
-
         form_data = {}
+
+        # Render customers compactly in a streamlined grid/card layout
         for c in customers:
             cid, name, phone, address, active, created = c
             
@@ -422,35 +534,33 @@ elif menu == "Daily Delivery":
                     else:
                         d_state[cid] = [{"item": AVAILABLE_ITEMS[0], "qty": 1.0, "status": "Delivered", "note": ""}]
 
-            with st.container(border=True):
-                st.markdown(f"**{name}**")
+            with st.container():
+                st.markdown(f'<div style="font-weight: 700; font-size: 15px; color: #1e293b; margin-bottom: 2px;">👤 {name}</div>', unsafe_allow_html=True)
                 rows_for_cust = d_state[cid]
                 updated_rows = []
                 
                 for idx, row_data in enumerate(rows_for_cust):
-                    col1, col2, col3, col4, col5 = st.columns([2.2, 1.1, 1.5, 2, 0.8])
+                    # Compact horizontal layout per item row to eliminate vertical scrolling
+                    c_it, c_qt, c_st, c_nt, c_rm = st.columns([2.5, 1.2, 1.5, 2.3, 0.5])
+                    
                     item_def_idx = AVAILABLE_ITEMS.index(row_data["item"]) if row_data["item"] in AVAILABLE_ITEMS else 0
-                    item_sel = col1.selectbox(t("Product", "பொருள்"), AVAILABLE_ITEMS, index=item_def_idx, key=f"d_item_{cid}_{idx}")
-                    qty_inp = col2.number_input(t("Qty", "அளவு"), min_value=0.0, max_value=100.0, value=float(row_data["qty"]), step=1.0, key=f"d_qty_{cid}_{idx}")
-                    status_sel = col3.selectbox(t("Status", "நிலை"), [t("Delivered", "Delivered"), t("No Milk", "No Milk")], index=0 if row_data["status"] in ["Delivered", "விநியோகிக்கப்பட்டது"] else 1, key=f"d_stat_{cid}_{idx}")
-                    note_inp = col4.text_input(t("Note", "குறிப்பு"), value=row_data["note"], key=f"d_note_{cid}_{idx}")
+                    item_sel = c_it.selectbox(t("Product", "பொருள்"), AVAILABLE_ITEMS, index=item_def_idx, key=f"d_item_{cid}_{idx}", label_visibility="collapsed")
+                    qty_inp = c_qt.number_input(t("Qty", "அளவு"), min_value=0.0, max_value=100.0, value=float(row_data["qty"]), step=1.0, key=f"d_qty_{cid}_{idx}", label_visibility="collapsed")
+                    status_sel = c_st.selectbox(t("Status", "நிலை"), [t("Delivered", "Delivered"), t("No Milk", "No Milk")], index=0 if row_data["status"] in ["Delivered", "விநியோகிக்கப்பட்டது"] else 1, key=f"d_stat_{cid}_{idx}", label_visibility="collapsed")
+                    note_inp = c_nt.text_input(t("Note", "குறிப்பு"), value=row_data["note"], placeholder=t("Note...", "குறிப்பு..."), key=f"d_note_{cid}_{idx}", label_visibility="collapsed")
                     
                     actual_status = "Delivered" if status_sel in ["Delivered", t("Delivered", "Delivered")] else "No Milk"
                     if actual_status == "No Milk":
                         qty_inp = 0.0
 
                     if len(rows_for_cust) > 1:
-                        if col5.button("❌", key=f"d_del_{cid}_{idx}"):
+                        if c_rm.button("❌", key=f"d_del_{cid}_{idx}"):
                             continue
                     
                     updated_rows.append({"item": item_sel, "qty": qty_inp, "status": actual_status, "note": note_inp})
 
                 d_state[cid] = updated_rows
-
-                if st.button(t("➕ Add Product", "➕ பொருள் சேர்க்க"), key=f"btn_add_prod_{cid}"):
-                    d_state[cid].append({"item": AVAILABLE_ITEMS[0], "qty": 1.0, "status": "Delivered", "note": ""})
-                    st.rerun()
-
+                st.markdown("<hr style='margin: 4px 0 8px 0; border: 0; border-top: 1px solid #e2e8f0;'>", unsafe_allow_html=True)
                 form_data[cid] = d_state[cid]
 
         if st.button(t("💾 Save Today's Delivery", "💾 இன்றைய விநியோகத்தை சேமிக்கவும்"), type="primary", use_container_width=True):
@@ -612,54 +722,54 @@ elif menu == "Billing & Receipts":
             p_foot = t("This is a computer-generated bill. For any queries, please contact 9489002466.", "இது கணினி மூலம் உருவாக்கப்பட்ட பில். ஏதேனும் குறைகள் இருந்தால் 9489002466 என்ற எண்ணைத் தொடர்பு கொள்ளவும்.")
 
             receipt_html = f"""
-            <div style="border: 2px solid #333; border-radius: 10px; padding: 25px 30px; background-color: #ffffff; font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; box-shadow: 0 2px 8px rgba(0,0,0,0.08); font-weight: bold; color: #000;">
-                <h2 style="text-align: center; margin-bottom: 2px; color: #1b5e20; font-weight: 800; font-size: 24px;">{p_title}</h2>
-                <p style="text-align: center; color: #333; margin-top: 0; font-size: 14px; font-weight: bold;">{p_sub}</p>
+            <div style="border: 2px solid #4f46e5; border-radius: 12px; padding: 25px 30px; background-color: #ffffff; font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; box-shadow: 0 4px 20px rgba(79,70,229,0.15); font-weight: bold; color: #000;">
+                <h2 style="text-align: center; margin-bottom: 2px; background: linear-gradient(90deg, #4f46e5, #06b6d4); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; font-size: 26px;">{p_title}</h2>
+                <p style="text-align: center; color: #555; margin-top: 0; font-size: 14px; font-weight: bold;">{p_sub}</p>
 
-                <hr style="border: 0; border-top: 2px solid #000; margin: 15px 0;">
+                <hr style="border: 0; border-top: 2px solid #4f46e5; margin: 15px 0;">
 
-                <p style="font-size: 15px; color: #000; margin: 8px 0; font-weight: bold;"><b>{p_cname}:</b> {customer_info[1]}</p>
-                <p style="font-size: 15px; color: #000; margin: 8px 0; font-weight: bold;"><b>{p_phone}:</b> {customer_info[2] or 'N/A'} | <b>{p_addr}:</b> {customer_info[3] or 'N/A'}</p>
+                <p style="font-size: 15px; color: #222; margin: 8px 0; font-weight: bold;"><b>{p_cname}:</b> {customer_info[1]}</p>
+                <p style="font-size: 15px; color: #222; margin: 8px 0; font-weight: bold;"><b>{p_phone}:</b> {customer_info[2] or 'N/A'} | <b>{p_addr}:</b> {customer_info[3] or 'N/A'}</p>
 
-                <hr style="border: 0; border-top: 2px solid #888; margin: 15px 0;">
+                <hr style="border: 0; border-top: 2px solid #ddd; margin: 15px 0;">
 
                 <table style="width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 14px; font-weight: bold;">
                     <thead>
-                        <tr style="font-weight: 800; color: #000;">
-                            <th style="text-align: left; border-bottom: 2px solid #000; padding: 8px 5px;">{p_prod}</th>
-                            <th style="text-align: center; border-bottom: 2px solid #000; padding: 8px 5px;">{p_qty}</th>
-                            <th style="text-align: right; border-bottom: 2px solid #000; padding: 8px 5px;">{p_price}</th>
-                            <th style="text-align: right; border-bottom: 2px solid #000; padding: 8px 5px;">{p_tot}</th>
+                        <tr style="font-weight: 800; color: #fff; background: #4f46e5;">
+                            <th style="text-align: left; padding: 10px 8px; border-top-left-radius: 6px; border-bottom-left-radius: 6px;">{p_prod}</th>
+                            <th style="text-align: center; padding: 10px 8px;">{p_qty}</th>
+                            <th style="text-align: right; padding: 10px 8px;">{p_price}</th>
+                            <th style="text-align: right; padding: 10px 8px; border-top-right-radius: 6px; border-bottom-right-radius: 6px;">{p_tot}</th>
                         </tr>
                     </thead>
                     <tbody>
-                        {item_rows_html if item_rows_html else f'<tr><td colspan="4" style="text-align:center; padding: 15px; color: #000; font-weight: bold;">{t("No delivery records for this month", "இந்த மாதத்தில் விநியோக பதிவுகள் இல்லை")}</td></tr>'}
+                        {item_rows_html if item_rows_html else f'<tr><td colspan="4" style="text-align:center; padding: 15px; color: #555; font-weight: bold;">{t("No delivery records for this month", "இந்த மாதத்தில் விநியோக பதிவுகள் இல்லை")}</td></tr>'}
                     </tbody>
                 </table>
 
-                <hr style="border: 0; border-top: 2px solid #000; margin: 15px 0;">
+                <hr style="border: 0; border-top: 2px solid #4f46e5; margin: 15px 0;">
 
-                <div style="display: flex; justify-content: space-between; align-items: center; font-size: 16px; padding: 5px 0; font-weight: 800; color: #000;">
+                <div style="display: flex; justify-content: space-between; align-items: center; font-size: 16px; padding: 5px 0; font-weight: 800; color: #111;">
                     <div>{p_tot_bill}:</div>
-                    <div style="color: #1b5e20; font-size: 18px;">₹{total:,.2f}</div>
+                    <div style="color: #4f46e5; font-size: 20px;">₹{total:,.2f}</div>
                 </div>
 
-                <hr style="border: 0; border-top: 2px solid #000; margin: 15px 0 20px 0;">
+                <hr style="border: 0; border-top: 2px solid #ddd; margin: 15px 0 20px 0;">
 
-                <div style="background-color: #e8f5e9; padding: 12px 15px; border-radius: 6px; margin-bottom: 15px; font-size: 13px; color: #1b5e20; line-height: 1.5; font-weight: bold; border: 1px solid #a5d6a7;">
+                <div style="background-color: #f0fdfa; padding: 12px 15px; border-radius: 8px; margin-bottom: 15px; font-size: 13px; color: #0f766e; line-height: 1.5; font-weight: bold; border: 1px solid #ccfbf1;">
                     <span style="font-weight: 800;">{p_pay_notice}</span><br>
                     {p_pay_desc}
                 </div>
 
-                <ul style="font-size: 12px; color: #000; line-height: 1.6; margin: 0; padding-left: 20px; font-weight: bold;">
+                <ul style="font-size: 12px; color: #333; line-height: 1.6; margin: 0; padding-left: 20px; font-weight: bold;">
                     <li>{p_note1}</li>
                     <li>{p_note2}</li>
                     <li>{p_note3}</li>
                 </ul>
-                <p style="font-size: 12px; color: #000; margin-top: 8px; margin-bottom: 0; font-weight: bold;"><b>{p_contact}</b> 8838594492 / 9489002466</p>
+                <p style="font-size: 12px; color: #222; margin-top: 8px; margin-bottom: 0; font-weight: bold;"><b>{p_contact}</b> 8838594492 / 9489002466</p>
 
-                <hr style="border: 0; border-top: 1px solid #aaa; margin: 15px 0;">
-                <p style="text-align: center; font-size: 11px; color: #333; font-style: italic; margin: 0; font-weight: bold;">{p_foot}</p>
+                <hr style="border: 0; border-top: 1px solid #ccc; margin: 15px 0;">
+                <p style="text-align: center; font-size: 11px; color: #666; font-style: italic; margin: 0; font-weight: bold;">{p_foot}</p>
             </div>
             """
             components.html(receipt_html, height=580, scrolling=True)
@@ -709,27 +819,27 @@ elif menu == "Billing & Receipts":
                         slip_items_html = ""
                         for itm_name, data in cust_item_breakdown.items():
                             subtotal = data["total_qty"] * data["rate"]
-                            slip_items_html += f"<div style='font-weight: bold; color: #000;'>• {itm_name}: <b>{data['days']} {t('day', 'நாள்')}</b> ({data['total_qty']:g} {t('pkts', 'பா.')} × ₹{data['rate']:.2f} = <b>₹{subtotal:,.2f}</b>)</div>"
+                            slip_items_html += f"<div style='font-weight: bold; color: #111;'>• {itm_name}: <b>{data['days']} {t('day', 'நாள்')}</b> ({data['total_qty']:g} {t('pkts', 'பா.')} × ₹{data['rate']:.2f} = <b>₹{subtotal:,.2f}</b>)</div>"
 
                         with cols[col_idx]:
                             slip_html = f"""
-                            <div style="border: 2px solid #000; padding: 5px 8px; background: #fff; font-size: 10px; color: #000; font-weight: bold; box-sizing: border-box; margin-bottom: 5px; border-radius: 4px; height: 46mm; display: flex; flex-direction: column; justify-content: space-between;">
+                            <div style="border: 2px solid #4f46e5; padding: 6px 10px; background: #fff; font-size: 10px; color: #000; font-weight: bold; box-sizing: border-box; margin-bottom: 6px; border-radius: 8px; height: 46mm; display: flex; flex-direction: column; justify-content: space-between; box-shadow: 0 2px 6px rgba(79,70,229,0.1);">
                                 <div>
-                                    <div style="font-weight: 800; text-align: center; font-size: 11px; margin-bottom: 2px; border-bottom: 1.5px solid #000; padding-bottom: 2px; color: #1b5e20;">🥛 {t('Aavin / Nanjil Milk & Curd', 'ஆவின் / நஞ்சில் பால் & தயிர்')} ({selected_month.strftime('%b %Y')})</div>
-                                    <div style="margin-bottom: 2px; font-weight: 800; font-size: 10.5px; color: #000;">{t('Name:', 'பெயர்:')} <span style="font-weight: 800; color: #000;">{name}</span></div>
-                                    <div style="border-top: 1px solid #ddd; padding-top: 2px; min-height: 20px; font-weight: bold; color: #000;">
+                                    <div style="font-weight: 800; text-align: center; font-size: 11px; margin-bottom: 2px; border-bottom: 1.5px solid #4f46e5; padding-bottom: 2px; color: #4f46e5;">🥛 {t('Aavin / Nanjil Milk & Curd', 'ஆவின் / நஞ்சில் பால் & தயிர்')} ({selected_month.strftime('%b %Y')})</div>
+                                    <div style="margin-bottom: 2px; font-weight: 800; font-size: 10.5px; color: #111;">{t('Name:', 'பெயர்:')} <span style="font-weight: 800; color: #4f46e5;">{name}</span></div>
+                                    <div style="border-top: 1px solid #eee; padding-top: 2px; min-height: 20px; font-weight: bold; color: #222;">
                                         {slip_items_html if slip_items_html else f'<div style="font-weight: bold;">{t("No deliveries", "விநியோக பதிவுகள் இல்லை")}</div>'}
                                     </div>
                                 </div>
                                 <div>
-                                    <div style="border-top: 1.5px solid #000; margin-top: 2px; padding-top: 2px; font-weight: 800; font-size: 11px; display: flex; justify-content: space-between; color: #000;">
-                                        <span>{t('Total Bill:', 'மொத்த பில்:')}</span> <span style="color: #1b5e20; font-weight: 800;">₹{total:,.2f}</span>
+                                    <div style="border-top: 1.5px solid #4f46e5; margin-top: 2px; padding-top: 2px; font-weight: 800; font-size: 11px; display: flex; justify-content: space-between; color: #111;">
+                                        <span>{t('Total Bill:', 'மொத்த பில்:')}</span> <span style="color: #4f46e5; font-weight: 800;">₹{total:,.2f}</span>
                                     </div>
-                                    <div style="font-size: 7px; background: #e8f5e9; padding: 2px; border-radius: 2px; margin-top: 1px; text-align: center; line-height: 1.2; font-weight: 800; color: #1b5e20; border: 1px solid #a5d6a7;">
+                                    <div style="font-size: 7px; background: #f0fdfa; padding: 2px; border-radius: 4px; margin-top: 1px; text-align: center; line-height: 1.2; font-weight: 800; color: #0f766e; border: 1px solid #ccfbf1;">
                                         GPay / UPI: <b>9489002466</b> ({t('Pechimuthu', 'பேச்சிமுத்து')})<br>
                                         {t('Please pay using GPay/UPI, avoid cash & share receipt.', 'தயவுசெய்து GPay/UPI மூலம் செலுத்தவும். ரொக்கத்தைத் தவிர்த்து, ரசீதைப் பகிரவும்.')}
                                     </div>
-                                    <div style="font-size: 6.5px; color: #000; text-align: center; margin-top: 1px; border-top: 1px dotted #000; padding-top: 1px; font-weight: bold;">
+                                    <div style="font-size: 6.5px; color: #555; text-align: center; margin-top: 1px; border-top: 1px dotted #ccc; padding-top: 1px; font-weight: bold;">
                                         {t('Computer generated bill. Contact:', 'இது கணினி பில். குறைகளுக்கு:')} <b>9489002466</b>
                                     </div>
                                 </div>
@@ -778,7 +888,6 @@ elif menu == "Reports":
     s_date, e_date, period_label = render_date_range_picker("rep")
     st.info(f"📆 **{t('Selected Period:', 'தேர்ந்தெடுக்கப்பட்ட காலம்:')}** `{period_label}`")
 
-    # Item/Brand Breakdown
     st.markdown(f"### 📊 {t('Brand & Profit Summary', 'பிராண்ட் மற்றும் லாப சுருக்கம்')}")
     breakdown = get_item_breakdown_by_date_range(s_date, e_date)
     if breakdown:
@@ -817,7 +926,6 @@ elif menu == "Reports":
 
     st.markdown("---")
     
-    # Day-by-Day Table
     st.markdown(f"### 📅 {t('Day-by-Day Breakdown (1 to 30/31)', 'நாள் வாரியான கணக்கீடு (1 முதல் 30/31 வரை)')}")
     daily_rows = get_daily_breakdown_by_date_range(s_date, e_date)
     matrix = get_daily_brand_matrix(s_date, e_date)
