@@ -13,23 +13,29 @@ def get_conn():
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
-# Updated item list with Nanjil Milk Red, Green Milk preserved, and dedicated Shop variants
+# Organized with Normal/Retail customer variants first, followed by Shop variants
 AVAILABLE_ITEMS = [
+    # --- Normal / Retail Customer Variants ---
     "Aavin Milk (250ml)",
     "Aavin Milk (500ml)",
-    "Aavin Milk (Shop) (250ml)",
-    "Aavin Milk (Shop) (500ml)",
     "Aavin Curd (100ml)",
     "Nanjil Milk Red (130ml)",
     "Nanjil Milk Red (500ml)",
     "Nanjil Milk Red (1 Litre)",
-    "Nanjil Milk Red (Shop) (500ml)",
-    "Nanjil Milk Red (Shop) (1 Litre)",
     "Nanjil Green Milk (500ml)",
     "Nanjil Green Milk (1 Litre)",
+    "Nanjil Curd (100ml)",
+    
+    # --- Shop Variants ---
+    "Aavin Milk (Shop) (250ml)",
+    "Aavin Milk (Shop) (500ml)",
+    "Aavin Curd (Shop) (100ml)",
+    "Nanjil Milk Red (Shop) (130ml)",
+    "Nanjil Milk Red (Shop) (500ml)",
+    "Nanjil Milk Red (Shop) (1 Litre)",
     "Nanjil Green Milk (Shop) (500ml)",
     "Nanjil Green Milk (Shop) (1 Litre)",
-    "Nanjil Curd (100ml)"
+    "Nanjil Curd (Shop) (100ml)"
 ]
 
 def _slug(item_name):
@@ -54,6 +60,13 @@ def init_db():
             address TEXT,
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS custom_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_name TEXT UNIQUE NOT NULL
         )
     """)
     
@@ -97,7 +110,6 @@ def init_db():
         )
     """)
     
-    # Check if cost_rate column exists for existing databases
     cur.execute("PRAGMA table_info(deliveries)")
     columns = [col[1] for col in cur.fetchall()]
     if "cost_rate" not in columns:
@@ -116,43 +128,27 @@ def init_db():
             FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE
         )
     """)
-    
-    try:
-        cur.execute("DELETE FROM customer_items WHERE item_name = 'Aavin Milk (100ml)'")
-        cur.execute("DELETE FROM deliveries WHERE item_name = 'Aavin Milk (100ml)'")
-    except Exception:
-        pass
 
-    # Migrate legacy Nanjil Milk entries to Nanjil Milk Red
-    try:
-        cur.execute("UPDATE customer_items SET item_name = 'Nanjil Milk Red (130ml)' WHERE item_name = 'Nanjil Milk (130ml)'")
-        cur.execute("UPDATE customer_items SET item_name = 'Nanjil Milk Red (500ml)' WHERE item_name = 'Nanjil Milk (500ml)'")
-        cur.execute("UPDATE customer_items SET item_name = 'Nanjil Milk Red (1 Litre)' WHERE item_name = 'Nanjil Milk (1 Litre)'")
-
-        cur.execute("UPDATE deliveries SET item_name = 'Nanjil Milk Red (130ml)' WHERE item_name = 'Nanjil Milk (130ml)'")
-        cur.execute("UPDATE deliveries SET item_name = 'Nanjil Milk Red (500ml)' WHERE item_name = 'Nanjil Milk (500ml)'")
-        cur.execute("UPDATE deliveries SET item_name = 'Nanjil Milk Red (1 Litre)' WHERE item_name = 'Nanjil Milk (1 Litre)'")
-    except Exception:
-        pass
-
-    # Default rates: (Cost Price / Buying Price, Selling Price)
-    # Shop rates are set with lower profit margins
     default_rates = {
         "Aavin Milk (250ml)": (10.80, 14.0),
         "Aavin Milk (500ml)": (22.0, 28.0),
-        "Aavin Milk (Shop) (250ml)": (10.80, 12.50),
-        "Aavin Milk (Shop) (500ml)": (22.0, 25.0),
         "Aavin Curd (100ml)": (8.50, 10.0),
         "Nanjil Milk Red (130ml)": (10.50, 13.0),
         "Nanjil Milk Red (500ml)": (37.0, 42.0),
         "Nanjil Milk Red (1 Litre)": (72.0, 84.0),
-        "Nanjil Milk Red (Shop) (500ml)": (37.0, 39.0),
-        "Nanjil Milk Red (Shop) (1 Litre)": (72.0, 78.0),
         "Nanjil Green Milk (500ml)": (33.0, 39.0),
         "Nanjil Green Milk (1 Litre)": (66.0, 76.50),
+        "Nanjil Curd (100ml)": (7.50, 10.0),
+        
+        "Aavin Milk (Shop) (250ml)": (10.80, 12.50),
+        "Aavin Milk (Shop) (500ml)": (22.0, 25.0),
+        "Aavin Curd (Shop) (100ml)": (8.50, 9.50),
+        "Nanjil Milk Red (Shop) (130ml)": (10.50, 11.50),
+        "Nanjil Milk Red (Shop) (500ml)": (37.0, 39.0),
+        "Nanjil Milk Red (Shop) (1 Litre)": (72.0, 78.0),
         "Nanjil Green Milk (Shop) (500ml)": (33.0, 36.0),
         "Nanjil Green Milk (Shop) (1 Litre)": (66.0, 71.0),
-        "Nanjil Curd (100ml)": (7.50, 10.0)
+        "Nanjil Curd (Shop) (100ml)": (7.50, 9.0)
     }
     
     for item, (cp, sp) in default_rates.items():
@@ -161,35 +157,32 @@ def init_db():
         cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (key_cp, str(cp)))
         cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (key_sp, str(sp)))
 
-    # Backfill missing or 0 cost_rate values in existing delivery records
-    for item in default_rates.keys():
-        key_cp = f"cost_rate_{_slug(item)}"
-        key_sp = f"rate_{_slug(item)}"
-        
-        cur.execute("SELECT value FROM settings WHERE key=?", (key_cp,))
-        row_cp = cur.fetchone()
-        cur.execute("SELECT value FROM settings WHERE key=?", (key_sp,))
-        row_sp = cur.fetchone()
-        
-        cp_val = float(row_cp[0]) if row_cp else default_rates[item][0]
-        sp_val = float(row_sp[0]) if row_sp else default_rates[item][1]
-
-        cur.execute(
-            "UPDATE deliveries SET cost_rate = ? WHERE item_name = ? AND (cost_rate IS NULL OR cost_rate = 0)",
-            (cp_val, item)
-        )
-        cur.execute(
-            "UPDATE deliveries SET rate = ? WHERE item_name = ? AND (rate IS NULL OR rate = 0)",
-            (sp_val, item)
-        )
-
     conn.commit()
     conn.close()
+
+def get_all_available_items():
+    conn = get_conn()
+    rows = conn.execute("SELECT item_name FROM custom_items").fetchall()
+    conn.close()
+    custom_list = [r[0] for r in rows]
+    combined = list(AVAILABLE_ITEMS)
+    for ci in custom_list:
+        if ci not in combined:
+            combined.append(ci)
+    return combined
+
+def add_custom_item(item_name, default_cp=20.0, default_sp=25.0):
+    conn = get_conn()
+    conn.execute("INSERT OR IGNORE INTO custom_items(item_name) VALUES(?)", (item_name,))
+    conn.commit()
+    conn.close()
+    set_item_rate(item_name, default_cp, default_sp)
 
 def get_item_rates():
     conn = get_conn()
     rates = {}
-    for item in AVAILABLE_ITEMS:
+    all_items = get_all_available_items()
+    for item in all_items:
         key_cp = f"cost_rate_{_slug(item)}"
         key_sp = f"rate_{_slug(item)}"
         row_cp = conn.execute("SELECT value FROM settings WHERE key=?", (key_cp,)).fetchone()
@@ -208,7 +201,6 @@ def set_item_rate(item, cost_price, sell_price):
     conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key_cp, str(cost_price)))
     conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key_sp, str(sell_price)))
     
-    # Retroactively sync cost_rate and rate across existing deliveries
     conn.execute("UPDATE deliveries SET cost_rate=?, rate=? WHERE item_name=?", (cost_price, sell_price, item))
     conn.commit()
     conn.close()
@@ -223,7 +215,7 @@ def add_customer(name, phone, address, items_list, active=True):
     cid = cur.lastrowid
     seen = set()
     for item_name, qty in items_list:
-        if item_name != 'Aavin Milk (100ml)' and item_name not in seen:
+        if item_name not in seen:
             seen.add(item_name)
             cur.execute("INSERT OR REPLACE INTO customer_items(customer_id, item_name, normal_qty) VALUES(?,?,?)", (cid, item_name, qty))
     conn.commit()
@@ -239,7 +231,7 @@ def update_customer(cid, name, phone, address, items_list, active):
     cur.execute("DELETE FROM customer_items WHERE customer_id=?", (cid,))
     seen = set()
     for item_name, qty in items_list:
-        if item_name != 'Aavin Milk (100ml)' and item_name not in seen:
+        if item_name not in seen:
             seen.add(item_name)
             cur.execute("INSERT OR REPLACE INTO customer_items(customer_id, item_name, normal_qty) VALUES(?,?,?)", (cid, item_name, qty))
     conn.commit()
@@ -276,14 +268,12 @@ def get_customer_items(cid):
     seen = set()
     unique_items = []
     for r in rows:
-        if r[1] != 'Aavin Milk (100ml)' and r[1] not in seen:
+        if r[1] not in seen:
             seen.add(r[1])
             unique_items.append({"id": r[0], "item_name": r[1], "normal_qty": r[2]})
     return unique_items
 
 def save_delivery(customer_id, delivery_date, item_name, quantity, cost_rate, sell_rate, status, note=""):
-    if item_name == 'Aavin Milk (100ml)':
-        return
     conn = get_conn()
     conn.execute("""
         INSERT INTO deliveries(customer_id, delivery_date, item_name, quantity, cost_rate, rate, status, note)
@@ -311,7 +301,7 @@ def get_customer_deliveries_for_date(customer_id, delivery_date):
         (customer_id, delivery_date)
     ).fetchall()
     conn.close()
-    return [{"id": r[0], "item_name": r[1], "quantity": r[2], "cost_rate": r[3], "rate": r[4], "status": r[5], "note": r[6]} for r in rows if r[1] != 'Aavin Milk (100ml)']
+    return [{"id": r[0], "item_name": r[1], "quantity": r[2], "cost_rate": r[3], "rate": r[4], "status": r[5], "note": r[6]} for r in rows]
 
 def get_deliveries(customer_id=None, date_or_month=None):
     conn = get_conn()
@@ -319,21 +309,20 @@ def get_deliveries(customer_id=None, date_or_month=None):
         if len(date_or_month) == 7:
             sql = """SELECT d.id, c.name, d.delivery_date, d.item_name, d.quantity, d.rate, d.status, d.note, d.cost_rate
                      FROM deliveries d JOIN customers c ON c.id=d.customer_id
-                     WHERE d.customer_id=? AND substr(d.delivery_date,1,7)=? AND d.item_name != 'Aavin Milk (100ml)'"""
+                     WHERE d.customer_id=? AND substr(d.delivery_date,1,7)=?"""
         else:
             sql = """SELECT d.id, c.name, d.delivery_date, d.item_name, d.quantity, d.rate, d.status, d.note, d.cost_rate
                      FROM deliveries d JOIN customers c ON c.id=d.customer_id
-                     WHERE d.customer_id=? AND d.delivery_date=? AND d.item_name != 'Aavin Milk (100ml)'"""
+                     WHERE d.customer_id=? AND d.delivery_date=?"""
         rows = conn.execute(sql, (customer_id, date_or_month)).fetchall()
     elif date_or_month:
         sql = """SELECT d.id, c.name, d.delivery_date, d.item_name, d.quantity, d.rate, d.status, d.note, d.cost_rate
                  FROM deliveries d JOIN customers c ON c.id=d.customer_id
-                 WHERE d.delivery_date=? AND d.item_name != 'Aavin Milk (100ml)'"""
+                 WHERE d.delivery_date=?"""
         rows = conn.execute(sql, (date_or_month,)).fetchall()
     else:
         sql = """SELECT d.id, c.name, d.delivery_date, d.item_name, d.quantity, d.rate, d.status, d.note, d.cost_rate
-                 FROM deliveries d JOIN customers c ON c.id=d.customer_id
-                 WHERE d.item_name != 'Aavin Milk (100ml)'"""
+                 FROM deliveries d JOIN customers c ON c.id=d.customer_id"""
         rows = conn.execute(sql).fetchall()
     conn.close()
     
@@ -350,7 +339,7 @@ def get_monthly_summary(customer_id, month):
         SELECT COALESCE(SUM(d.quantity),0),
                COALESCE(SUM(d.quantity * d.rate),0)
         FROM deliveries d
-        WHERE d.customer_id=? AND substr(d.delivery_date,1,7)=? AND d.item_name != 'Aavin Milk (100ml)'
+        WHERE d.customer_id=? AND substr(d.delivery_date,1,7)=?
     """, (customer_id, month)).fetchone()
     conn.close()
     return {"litres": float(row[0] or 0), "total": float(row[1] or 0)}
@@ -385,7 +374,7 @@ def get_dashboard_stats(start_date, end_date=None):
           COALESCE(SUM(quantity), 0),
           COALESCE(SUM(CASE WHEN (status='Delivered' OR status='விநியோகிக்கப்பட்டது') AND quantity > 0 THEN quantity * cost_rate ELSE 0 END), 0),
           COALESCE(SUM(CASE WHEN (status='Delivered' OR status='விநியோகிக்கப்பட்டது') AND quantity > 0 THEN quantity * rate ELSE 0 END), 0)
-        FROM deliveries WHERE delivery_date BETWEEN ? AND ? AND item_name != 'Aavin Milk (100ml)'
+        FROM deliveries WHERE delivery_date BETWEEN ? AND ?
     """, (start_date, end_date)).fetchone()
     conn.close()
     
@@ -415,7 +404,7 @@ def get_item_breakdown_by_date_range(start_date, end_date=None):
             SUM(CASE WHEN (status='Delivered' OR status='விநியோகிக்கப்பட்டது') AND quantity > 0 THEN quantity * cost_rate ELSE 0 END) as total_cost,
             SUM(CASE WHEN (status='Delivered' OR status='விநியோகிக்கப்பட்டது') AND quantity > 0 THEN quantity * rate ELSE 0 END) as total_sell
         FROM deliveries
-        WHERE delivery_date BETWEEN ? AND ? AND item_name != 'Aavin Milk (100ml)'
+        WHERE delivery_date BETWEEN ? AND ?
         GROUP BY item_name
         ORDER BY item_name
     """
@@ -444,7 +433,7 @@ def get_daily_breakdown_by_date_range(start_date, end_date):
             SUM(CASE WHEN (status='Delivered' OR status='விநியோகிக்கப்பட்டது') AND quantity > 0 THEN quantity * cost_rate ELSE 0 END) as total_cost,
             SUM(CASE WHEN (status='Delivered' OR status='விநியோகிக்கப்பட்டது') AND quantity > 0 THEN quantity * rate ELSE 0 END) as total_sell
         FROM deliveries
-        WHERE delivery_date BETWEEN ? AND ? AND item_name != 'Aavin Milk (100ml)'
+        WHERE delivery_date BETWEEN ? AND ?
         GROUP BY delivery_date
         ORDER BY delivery_date ASC
     """
@@ -468,7 +457,7 @@ def get_daily_brand_matrix(start_date, end_date):
     sql = """
         SELECT delivery_date, item_name, SUM(quantity)
         FROM deliveries
-        WHERE delivery_date BETWEEN ? AND ? AND (status='Delivered' OR status='விநியோகிக்கப்பட்டது') AND quantity > 0 AND item_name != 'Aavin Milk (100ml)'
+        WHERE delivery_date BETWEEN ? AND ? AND (status='Delivered' OR status='விநியோகிக்கப்பட்டது') AND quantity > 0
         GROUP BY delivery_date, item_name
         ORDER BY delivery_date ASC, item_name ASC
     """
@@ -491,7 +480,7 @@ def export_customers_csv():
     for c in customers:
         cid, name, phone, address, active, created = c
         items = get_customer_items(cid)
-        items_str = " | ".join([f"{i['item_name']} ({i['normal_qty']:g})" for i in items if i['item_name'] != 'Aavin Milk (100ml)'])
+        items_str = " | ".join([f"{i['item_name']} ({i['normal_qty']:g})" for i in items])
         writer.writerow([cid, name, phone or "", address or "", items_str, active, created])
     return out.getvalue().encode("utf-8-sig")
 
@@ -508,7 +497,7 @@ def export_range_deliveries_csv(start_date, end_date):
     sql = """
         SELECT d.id, c.name, c.phone, d.delivery_date, d.item_name, d.quantity, d.cost_rate, d.rate, (d.quantity * d.cost_rate) as total_cost, (d.quantity * d.rate) as total_sell, ((d.quantity * d.rate) - (d.quantity * d.cost_rate)) as profit, d.status, d.note
         FROM deliveries d JOIN customers c ON c.id=d.customer_id
-        WHERE d.delivery_date BETWEEN ? AND ? AND d.item_name != 'Aavin Milk (100ml)'
+        WHERE d.delivery_date BETWEEN ? AND ?
         ORDER BY d.delivery_date ASC, c.name ASC
     """
     rows = conn.execute(sql, (start_date, end_date)).fetchall()
@@ -523,17 +512,18 @@ def export_range_deliveries_csv(start_date, end_date):
 def export_daily_summary_csv(start_date, end_date):
     daily_rows = get_daily_breakdown_by_date_range(start_date, end_date)
     matrix = get_daily_brand_matrix(start_date, end_date)
+    all_items = get_all_available_items()
     
     out = io.StringIO()
     writer = csv.writer(out)
     
-    headers = ["Date", "Delivered Customers", "No Milk Customers", "Total Delivered Qty", "Total Cost (₹)", "Total Revenue (₹)", "Profit (₹)"] + AVAILABLE_ITEMS
+    headers = ["Date", "Delivered Customers", "No Milk Customers", "Total Delivered Qty", "Total Cost (₹)", "Total Revenue (₹)", "Profit (₹)"] + all_items
     writer.writerow(headers)
     
     for row in daily_rows:
         d = row["delivery_date"]
         b_map = matrix.get(d, {})
-        brand_qtys = [b_map.get(item, 0.0) for item in AVAILABLE_ITEMS]
+        brand_qtys = [b_map.get(item, 0.0) for item in all_items]
         writer.writerow([d, row["delivered_cust"], row["undelivered_cust"], row["delivered_qty"], row["total_cost"], row["total_sell"], row["profit"]] + brand_qtys)
         
     return out.getvalue().encode("utf-8-sig")
