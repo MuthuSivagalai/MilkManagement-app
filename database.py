@@ -225,8 +225,8 @@ def update_customer(cid, name, phone, address, items_list, active):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE customers SET name=?, phone=?, address=?, active=? WHERE id=?",
-        (name, phone, address, int(active), cid)
+        "UPDATE customers SET name=?, phone=?, active=? WHERE id=?",
+        (name, phone, int(active), cid)
     )
     cur.execute("DELETE FROM customer_items WHERE customer_id=?", (cid,))
     seen = set()
@@ -234,6 +234,17 @@ def update_customer(cid, name, phone, address, items_list, active):
         if item_name not in seen:
             seen.add(item_name)
             cur.execute("INSERT OR REPLACE INTO customer_items(customer_id, item_name, normal_qty) VALUES(?,?,?)", (cid, item_name, qty))
+    conn.commit()
+    conn.close()
+
+def update_customers_batch(updated_rows):
+    conn = get_conn()
+    cur = conn.cursor()
+    for row in updated_rows:
+        cur.execute(
+            "UPDATE customers SET name=?, phone=?, active=? WHERE id=?",
+            (row["name"], row["phone"], int(row["active"]), row["id"])
+        )
     conn.commit()
     conn.close()
 
@@ -302,6 +313,26 @@ def get_customer_deliveries_for_date(customer_id, delivery_date):
     ).fetchall()
     conn.close()
     return [{"id": r[0], "item_name": r[1], "quantity": r[2], "cost_rate": r[3], "rate": r[4], "status": r[5], "note": r[6]} for r in rows]
+
+def get_customer_deliveries_by_date_range(customer_id, start_date, end_date):
+    conn = get_conn()
+    sql = """
+        SELECT delivery_date, item_name, quantity, cost_rate, rate, status, note
+        FROM deliveries
+        WHERE customer_id=? AND delivery_date BETWEEN ? AND ?
+        ORDER BY delivery_date ASC, item_name ASC
+    """
+    rows = conn.execute(sql, (customer_id, start_date, end_date)).fetchall()
+    conn.close()
+    return [{
+        "delivery_date": r[0],
+        "item_name": r[1],
+        "quantity": float(r[2] or 0),
+        "cost_rate": float(r[3] or 0),
+        "rate": float(r[4] or 0),
+        "status": r[5],
+        "note": r[6] or ""
+    } for r in rows]
 
 def get_deliveries(customer_id=None, date_or_month=None):
     conn = get_conn()
@@ -476,12 +507,12 @@ def export_customers_csv():
     customers = get_customers(include_inactive=True)
     out = io.StringIO()
     writer = csv.writer(out)
-    writer.writerow(["ID", "Name", "Phone", "Address", "Default Items & Qty", "Active", "Created At"])
+    writer.writerow(["ID", "Name", "Phone", "Default Items & Qty", "Active", "Created At"])
     for c in customers:
         cid, name, phone, address, active, created = c
         items = get_customer_items(cid)
         items_str = " | ".join([f"{i['item_name']} ({i['normal_qty']:g})" for i in items])
-        writer.writerow([cid, name, phone or "", address or "", items_str, active, created])
+        writer.writerow([cid, name, phone or "", items_str, active, created])
     return out.getvalue().encode("utf-8-sig")
 
 def export_deliveries_csv():
@@ -532,7 +563,7 @@ def export_all_customers_monthly_report_csv(month):
     customers = get_customers(include_inactive=True)
     out = io.StringIO()
     writer = csv.writer(out)
-    writer.writerow(["Customer ID", "Customer Name", "Phone", "Address", "Month", "Total Items / Qty", "Total Bill Amount (₹)", "Total Paid (₹)", "Balance Due (₹)"])
+    writer.writerow(["Customer ID", "Customer Name", "Phone", "Month", "Total Items / Qty", "Total Bill Amount (₹)", "Total Paid (₹)", "Balance Due (₹)"])
     for c in customers:
         cid, name, phone, address, _, _ = c
         summary = get_monthly_summary(cid, month)
@@ -540,5 +571,5 @@ def export_all_customers_monthly_report_csv(month):
         paid = sum(float(p[3]) for p in payments)
         total = summary["total"]
         balance = total - paid
-        writer.writerow([cid, name, phone or "", address or "", month, f"{summary['litres']:.2f}", f"{total:.2f}", f"{paid:.2f}", f"{balance:.2f}"])
+        writer.writerow([cid, name, phone or "", month, f"{summary['litres']:.2f}", f"{total:.2f}", f"{paid:.2f}", f"{balance:.2f}"])
     return out.getvalue().encode("utf-8-sig")
