@@ -88,7 +88,7 @@ with top_col1:
 with top_col2:
     st.radio("🌐 Language / மொழி", ["English", "தமிழ்"], key="app_lang", horizontal=True)
 
-menu_options_en = ["🏠 Dashboard", "⚙️️ Item Rates", "👥 Customers", "🥛 Daily Delivery", "🧾 Billing & Receipts", "💵 Payments", "📊 Reports"]
+menu_options_en = ["🏠 Dashboard", "⚙ Item Rates", "👥 Customers", "🥛 Daily Delivery", "🧾 Billing & Receipts", "💵 Payments", "📊 Reports"]
 menu_options_ta = ["🏠 டாஷ்போர்டு", "⚙️ பொருள் விலைகள்", "👥 வாடிக்கையாளர்கள்", "🥛 தினசரி விநியோகம்", "🧾 பில் & ரசீதுகள்", "💵 செலுத்திய தொகைகள்", "📊 அறிக்கைகள்"]
 
 # Sidebar Menu & Logout Button
@@ -178,7 +178,6 @@ if menu == "Dashboard":
     c4.metric(t("Total Quantity (Pkts)", "மொத்த அளவு (பாக்கெட்டுகள்)"), f'{stats["litres"]:.2f}')
 
     st.markdown("---")
-    # Financial Summary Metrics
     f1, f2, f3 = st.columns(3)
     f1.metric(t("Total Cost (₹)", "மொத்த வாங்கிய விலை (₹)"), f"₹{stats['total_cost']:,.2f}")
     f2.metric(t("Total Revenue (₹)", "மொத்த விற்பனை (₹)"), f"₹{stats['total_sell']:,.2f}")
@@ -186,7 +185,6 @@ if menu == "Dashboard":
 
     st.markdown("---")
     
-    # Tab layout for Brand Breakdown and Day-by-Day view
     tab_brand, tab_daily = st.tabs([
         t("🥛 Brand & Profit Breakdown", "🥛 பிராண்ட் மற்றும் லாப சுருக்கம்"),
         t("📅 Day-by-Day (1 to 30/31) Calculation", "📅 நாள் வாரியான (1 முதல் 30/31) கணக்கீடு")
@@ -244,17 +242,19 @@ elif menu == "Item Rates":
     st.subheader(t("Configure Cost & Selling Prices (₹ per item/packet)", "பொருள் அடக்க மற்றும் விற்பனை விலைகளை அமைக்குக (₹)"))
     
     with st.form("item_rates_form"):
+        st.markdown('<div style="max-height: 65vh; overflow-y: auto; padding-right: 10px;">', unsafe_allow_html=True)
         new_rates = {}
         for item in AVAILABLE_ITEMS:
             curr_rates = item_rates.get(item, {"cost_price": 20.0, "sell_price": 25.0})
-            st.markdown(f"#### 🥛 {item}")
+            st.markdown(f"**🥛 {item}**")
             col_cp, col_sp = st.columns(2)
-            cp_val = col_cp.number_input(f"{t('Cost Price / Buying Price (₹)', 'அடக்க / வாங்கிய விலை (₹)')} - {item}", min_value=0.0, value=float(curr_rates["cost_price"]), step=0.50, key=f"cp_{item}")
+            cp_val = col_cp.number_input(f"{t('Cost Price / Buying (₹)', 'அடக்க விலை (₹)')} - {item}", min_value=0.0, value=float(curr_rates["cost_price"]), step=0.50, key=f"cp_{item}")
             sp_val = col_sp.number_input(f"{t('Selling Price (₹)', 'விற்பனை விலை (₹)')} - {item}", min_value=0.0, value=float(curr_rates["sell_price"]), step=0.50, key=f"sp_{item}")
             new_rates[item] = {"cost_price": cp_val, "sell_price": sp_val}
             st.markdown("---")
+        st.markdown('</div>', unsafe_allow_html=True)
         
-        submitted = st.form_submit_button(t("💾 Save Cost & Sell Rates", "💾 விலைகளை சேமிக்கவும்"), type="primary")
+        submitted = st.form_submit_button(t("💾 Save Cost & Sell Rates", "💾 விலைகளை சேமிக்கவும்"), type="primary", use_container_width=True)
         if submitted:
             for item, r in new_rates.items():
                 set_item_rate(item, r["cost_price"], r["sell_price"])
@@ -777,7 +777,6 @@ elif menu == "Reports":
     s_date, e_date, period_label = render_date_range_picker("rep")
     st.info(f"📆 **{t('Selected Period:', 'தேர்ந்தெடுக்கப்பட்ட காலம்:')}** `{period_label}`")
 
-    # Item/Brand Breakdown
     st.markdown(f"### 📊 {t('Brand & Profit Summary', 'பிராண்ட் மற்றும் லாப சுருக்கம்')}")
     breakdown = get_item_breakdown_by_date_range(s_date, e_date)
     if breakdown:
@@ -816,7 +815,6 @@ elif menu == "Reports":
 
     st.markdown("---")
     
-    # Day-by-Day Table
     st.markdown(f"### 📅 {t('Day-by-Day Breakdown (1 to 30/31)', 'நாள் வாரியான கணக்கீடு (1 முதல் 30/31 வரை)')}")
     daily_rows = get_daily_breakdown_by_date_range(s_date, e_date)
     matrix = get_daily_brand_matrix(s_date, e_date)
