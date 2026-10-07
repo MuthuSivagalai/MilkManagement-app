@@ -244,6 +244,7 @@ elif menu == "Item Rates":
     st.subheader(t("Configure Cost & Selling Prices (₹ per item/packet)", "பொருள் அடக்க மற்றும் விற்பனை விலைகளை அமைக்குக (₹)"))
     
     with st.form("item_rates_form"):
+        st.markdown('<div style="max-height: 65vh; overflow-y: auto; padding-right: 10px;">', unsafe_allow_html=True)
         new_rates = {}
         for item in AVAILABLE_ITEMS:
             curr_rates = item_rates.get(item, {"cost_price": 20.0, "sell_price": 25.0})
