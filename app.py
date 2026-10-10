@@ -1,19 +1,31 @@
+import html
+import re
 import streamlit as st
 import streamlit.components.v1 as components
 import calendar
+import pandas as pd
 from datetime import date, datetime
 import urllib.parse
 from database import (
-    init_db, AVAILABLE_ITEMS, get_item_rates, set_item_rate, add_customer, update_customer,
-    delete_customer, get_customers, get_customer, get_customer_items, save_delivery, clear_deliveries_for_date,
-    get_customer_deliveries_for_date, get_deliveries, get_monthly_summary, add_payment, get_payments,
-    get_dashboard_stats, export_deliveries_csv, export_customers_csv, export_all_customers_monthly_report_csv,
-    get_item_breakdown_by_date_range, get_daily_breakdown_by_date_range, get_daily_brand_matrix,
-    export_range_deliveries_csv, export_daily_summary_csv
+    init_db, refresh_items, add_item, AVAILABLE_ITEMS, natural_sort_key, item_code, update_customer, get_item_rates, set_item_rates, add_customer,
+    delete_customer, get_customers, get_customer, get_all_customer_items,
+    get_deliveries_map_for_date, save_daily_deliveries,
+    get_monthly_summary, get_all_month_items, get_all_monthly_billing, add_payment, get_payments,
+    get_dashboard_stats, get_item_breakdown_by_date_range, get_daily_breakdown_by_date_range,
+    get_customer_date_totals, get_extra_report, get_all_month_daily,
+    export_range_deliveries_csv, export_daily_summary_csv, export_extra_report_csv,
+    export_all_customers_monthly_report_csv,
+    rename_item, get_settings_by_prefix, set_settings, get_item_tamil_names, set_item_tamil_name,
+    add_payments_bulk, get_payments_between, get_payer_aliases, save_payer_aliases, delete_payment,
+    get_existing_txn_refs, get_saved_dates, get_no_milk_customers
 )
+from tamil_text import (STR as _STR, DEFAULT_MSG, tamil_item, has_untranslated_words, ta_month_label, ta_short_date)
+from payments_import import (read_statement, detect_columns, parse_transactions, extract_payer, match_customer,
+                             suggest_month, month_add, norm as norm_payer)
 
 st.set_page_config(page_title="Milk & Curd Delivery Management", page_icon="🥛", layout="wide")
-init_db()
+init_db()  # cached: creates / migrates tables only once per server start
+refresh_items()  # built-in items + items added by admin
 
 # ---------------- Credentials Config ----------------
 USER_CREDENTIALS = {
@@ -22,6 +34,340 @@ USER_CREDENTIALS = {
     "pechimuthu": "pechi2026",
     "staff": "staff123"
 }
+
+DEFAULT_RATE = {"cost_price": 20.0, "sell_price": 25.0}
+
+# Only these users can add new items / brands (Item Rates page)
+ADMIN_USERS = ["admin"]
+
+# ---------------- Bill / receipt settings (edit these) ----------------
+BILL_TITLE = "Aavin / Nanjil Milk & Curd"
+BILL_TITLE_TA = "ஆவின் / நஞ்சில் பால் & தயிர்"
+UPI_NUMBER = "9489002466"
+UPI_NAME = "Pechimuthu"
+CONTACT_NUMBERS = "8838594492 / 9489002466"
+SLIPS_PER_PAGE = 8  # 2 columns x 4 rows on A4
+
+
+def esc(x):
+    return html.escape(str(x))
+
+
+def _m(x):
+    """Rupees without decimals when whole (56), with 2 decimals only if there really are paise (56.50)."""
+    x = float(x or 0)
+    return f"{x:,.0f}" if abs(x - round(x)) < 0.005 else f"{x:,.2f}"
+
+
+def num_cfg(df):
+    """column_config that shows numbers without trailing zeros (130 instead of 130.000000)."""
+    return {c: st.column_config.NumberColumn(format="%.8g") for c in df.columns
+            if pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])}
+
+
+def reset_daily_sheets():
+    """Customer defaults changed -> any not-yet-saved daily sheet must be rebuilt from the new defaults."""
+    for k in [k for k in st.session_state if k.startswith("daily_df_")]:
+        del st.session_state[k]
+    for k in [k for k in st.session_state if k.startswith("daily_ver_")]:
+        st.session_state[k] += 1  # new editor key, so old cell edits are not re-applied
+
+
+def purge_item_widgets():
+    """An item was renamed: forget every widget / sheet that still holds the old name."""
+    reset_daily_sheets()
+    for pre in ("cust_add_item_", "e_item_", "edit_items_", "add_extra_prod"):
+        for k in [k for k in st.session_state if k.startswith(pre)]:
+            del st.session_state[k]
+    st.session_state.pop("add_cust_items", None)
+
+
+def drop_empty_extra_rows(df, name_to_id, default_map):
+    """A row with Normal Qty 0 and Extra Qty 0 that is NOT one of the customer's regular products is a leftover of
+    an extra that was removed (or set to 0) -> delete it. Regular-product rows with 0 are kept (that is how
+    'No Milk' is stored). A customer never loses all his rows, so No Milk is still recorded for him."""
+    if df.empty:
+        return df
+    total = df["Normal Qty"].fillna(0) + df["Extra Qty"].fillna(0)
+    drop = []
+    for cname, grp in df.groupby("Customer Name", sort=False):
+        defaults = {i for i, _ in default_map.get(name_to_id.get(cname), [])}
+        zero = [i for i in grp.index if total[i] <= 0 and grp.at[i, "Product"] not in defaults]
+        if len(zero) == len(grp):  # nothing else left for this customer: keep one row
+            zero = zero[1:]
+        drop += zero
+    return df.drop(index=drop).reset_index(drop=True)
+
+
+def clean_phone(phone):
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return "91" + digits
+    if len(digits) == 12 and digits.startswith("91"):
+        return digits
+    return None
+
+
+def whatsapp_link(phone, message):
+    p = clean_phone(phone)
+    if not p:
+        return None
+    return f"https://api.whatsapp.com/send?phone={p}&text={urllib.parse.quote(message)}"
+
+
+# Greeting + announcements printed on receipts / WhatsApp. Filled from the database by receipt_message_panel().
+RCFG = {"ta": {"greeting": "", "notes": []}, "en": {"greeting": "", "notes": []}}
+ITEM_TA = {}  # Tamil names typed by the owner for items (Item Rates -> Edit item name)
+
+
+def S(lang, key, **kw):
+    s_ = _STR[lang][key]
+    return s_.format(**kw) if kw else s_
+
+
+def title_of(lang):
+    return BILL_TITLE_TA if lang == "ta" else BILL_TITLE
+
+
+def disp(item, lang):
+    """Item name in the receipt language."""
+    return tamil_item(item, ITEM_TA) if lang == "ta" else item
+
+
+def _days(n, lang="en"):
+    if lang == "ta":
+        return f"{n} {S('ta', 'day_one') if n == 1 else S('ta', 'day_many')}"
+    return f"{n} day{'s' if n != 1 else ''}"
+
+
+def _rate(it):
+    return it["amount"] / it["total"] if it["total"] else 0.0
+
+
+# ---------------- Brand colours (Aavin = blue, Nanjil Red = red, Nanjil Green = green) ----------------
+_FALLBACK_COLORS = ["#fde68a", "#e9d5ff", "#fbcfe8", "#a7f3d0", "#bae6fd", "#fed7aa"]
+
+
+def brand_color(text_):
+    s = str(text_).strip()
+    if not s:
+        return ""
+    a, n = "Aavin" in s, "Nanjil" in s
+    if a and n:
+        return "#fef3c7"  # mixed cell -> amber
+    if a:
+        return "#dbeafe"
+    if n:
+        return "#dcfce7" if "Green" in s else "#fee2e2"
+    first = s.split()[0]  # a brand added later by the admin gets its own stable colour
+    if not first[:1].isalpha():
+        return ""
+    return _FALLBACK_COLORS[sum(map(ord, first.lower())) % len(_FALLBACK_COLORS)]
+
+
+def style_brand(df, cols):
+    """Colour the given columns of a DataFrame by brand (works for st.dataframe and st.data_editor)."""
+    styler = df.style
+    apply_fn = getattr(styler, "map", None) or styler.applymap
+    return apply_fn(lambda v: f"background-color:{brand_color(v)}" if brand_color(v) else "", subset=cols)
+
+
+def brand_span(item, lang="en"):
+    c = brand_color(item)
+    label = esc(disp(item, lang))
+    return f"<span style='background:{c};padding:0 4px;border-radius:3px'>{label}</span>" if c else label
+
+
+def _short_date(d, lang="en"):
+    if lang == "ta":
+        return ta_short_date(d)
+    return datetime.strptime(d, "%Y-%m-%d").strftime("%d %b")
+
+
+def daily_line(day, lang="en"):
+    """'09 Oct: 2 Aavin250 + 1 Nanjil130 = ₹56'  or  '10 Oct: No milk'  (Tamil: item names in Tamil)"""
+    if not day["entries"]:
+        return f"{_short_date(day['date'], lang)}: {S(lang, 'no_milk')}"
+    nm = (lambda i: disp(i, "ta")) if lang == "ta" else item_code
+    parts = " + ".join(f"{q:g} {nm(i)}" + (f" (+{e:g} {S(lang, 'extra')})" if e else "") for i, q, e, _ in day["entries"])
+    return f"{_short_date(day['date'], lang)}: {parts} = ₹{_m(day['amount'])}"
+
+
+def whatsapp_message(name, month_label, items, total, paid, daily=None, lang="en"):
+    cfg = RCFG[lang]
+    lines = []
+    if cfg["greeting"]:
+        lines += [cfg["greeting"], ""]
+    lines += [f"*{title_of(lang)}*", S(lang, "bill_for", month=month_label), f"{S(lang, 'name')}: {name}", ""]
+    for it in items:
+        lines.append(f"• {disp(it['item'], lang)}: {_days(it['days'], lang)} "
+                     f"({it['total']:g} {S(lang, 'pkts')} × ₹{_m(_rate(it))} = ₹{_m(it['amount'])})")
+        if it["extra"] > 0:
+            lines.append("   (" + S(lang, "incl_extra", n=f"{it['extra']:g}") + ")")
+    if daily:
+        lines += ["", f"*{S(lang, 'day_by_day')}*"] + [daily_line(d, lang) for d in daily]
+    lines += ["", f"*{S(lang, 'total_wa')}: ₹{_m(total)}*"]
+    if paid > 0:
+        lines += [f"{S(lang, 'paid')}: ₹{_m(paid)}", f"*{S(lang, 'balance')}: ₹{_m(total - paid)}*"]
+    lines += ["", "📲 " + S(lang, "upi_msg"), f"*{S(lang, 'upi_line')}: {UPI_NUMBER} ({UPI_NAME})*"]
+    if cfg["notes"]:
+        lines += ["", f"📢 *{S(lang, 'notes_title')}*"] + [f"✨ {n}" for n in cfg["notes"]]
+    lines += ["", f"📞 {S(lang, 'contact')}: {CONTACT_NUMBERS}"]
+    return "\n".join(lines)
+
+
+_RECEIPT_CSS = """
+body{font-family:'Noto Sans Tamil','Nirmala UI','Latha',Arial,Helvetica,sans-serif;margin:0;padding:8px;color:#111}
+.greet{background:#eef2ff;border-radius:6px;padding:8px 10px;font-size:13px;margin:0 0 10px;text-align:center;font-weight:600}
+.notes{background:#fffbeb;border:1px solid #fcd34d;border-radius:6px;padding:6px 10px;font-size:12px;margin:8px 0}
+.notes ul{margin:4px 0 0}
+.upi{font-size:15px;font-weight:700;color:#0f766e;margin-top:4px}
+.card{max-width:640px;margin:auto;border:1.5px solid #4f46e5;border-radius:8px;padding:18px;background:#fff}
+h2{margin:0;text-align:center;color:#4f46e5;font-size:20px}
+.sub{text-align:center;font-size:13px;margin:4px 0 12px}
+hr{border:0;border-top:1px solid #4f46e5;margin:10px 0}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:#4f46e5;color:#fff;padding:6px;text-align:left}
+td{padding:6px;border-bottom:1px solid #e5e7eb}
+.r{text-align:right}.c{text-align:center}
+.total{display:flex;justify-content:space-between;font-size:17px;font-weight:700;margin:10px 0}
+.total span:last-child{color:#4f46e5}
+.pay{background:#f0fdfa;border:1px solid #99f6e4;border-radius:6px;padding:8px;font-size:12px;margin:10px 0}
+ul{font-size:12px;padding-left:18px;margin:6px 0}
+.foot{font-size:11px;text-align:center;font-style:italic;margin-top:10px}
+.act{max-width:640px;margin:10px auto;display:flex;gap:8px}
+.act button{flex:1;padding:10px;border:0;border-radius:6px;color:#fff;font-weight:700;font-size:14px;cursor:pointer}
+"""
+
+# Buttons under the preview: turn the receipt into a PNG picture, then share / download it.
+_RECEIPT_ACTIONS = """
+<div class='act'>
+<button style='background:#16a34a' onclick='sh()'>📤 Share (WhatsApp)</button>
+<button style='background:#4f46e5' onclick='dl()'>📥 Download image</button></div>
+<script src='https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js'></script>
+<script>
+async function mkBlob(){
+  const c = await html2canvas(document.getElementById('rcpt'), {scale:2, backgroundColor:'#ffffff'});
+  return await new Promise(r => c.toBlob(r, 'image/png'));
+}
+async function dl(){
+  try{
+    const b = await mkBlob(); const a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = '__FN__.png'; a.click();
+  }catch(e){ alert('Could not create the image: ' + e); }
+}
+async function sh(){
+  try{
+    const b = await mkBlob(); const f = new File([b], '__FN__.png', {type:'image/png'});
+    if(navigator.canShare && navigator.canShare({files:[f]})){
+      try{ await navigator.share({files:[f], title:'__TITLE__'}); return; }
+      catch(e){ if(e && e.name === 'AbortError') return; }
+    }
+    alert('Sharing is not available in this browser, so the image is downloaded. Attach it in WhatsApp.');
+    dl();
+  }catch(e){ alert('Could not create the image: ' + e); }
+}
+</script>"""
+
+
+def receipt_html(name, phone, address, month_label, items, total, paid, daily=None, actions=False, filename="receipt", lang="en"):
+    cfg = RCFG[lang]
+    daily_html = ""
+    if daily:
+        drows = ""
+        for d in daily:
+            if d["entries"]:
+                what = "<br>".join(f"{q:g} × {brand_span(i, lang)}" + (f" <i>(+{e:g} {S(lang, 'extra')})</i>" if e else "") for i, q, e, _ in d["entries"])
+                amt = f"₹{_m(d['amount'])}"
+            else:
+                what, amt = f"<i>{S(lang, 'no_milk')}</i>", "₹0"
+            drows += f"<tr><td>{_short_date(d['date'], lang)}</td><td>{what}</td><td class='r'>{amt}</td></tr>"
+        daily_html = (f"<div style='font-weight:700;margin:6px 0'>{S(lang, 'daywise')}</div>"
+                      f"<table><tr><th>{S(lang, 'col_date')}</th><th>{S(lang, 'col_items')}</th><th class='r'>{S(lang, 'col_amount')}</th></tr>{drows}</table><hr>")
+    rows = ""
+    for it in items:
+        extra = f" <i>({S(lang, 'incl_extra', n=format(it['extra'], 'g'))})</i>" if it["extra"] > 0 else ""
+        rows += (f"<tr><td><b>{brand_span(it['item'], lang)}</b></td>"
+                 f"<td class='c'>{_days(it['days'], lang)} ({it['total']:g} {S(lang, 'pkts')}){extra}</td>"
+                 f"<td class='r'>₹{_m(_rate(it))}</td><td class='r'>₹{_m(it['amount'])}</td></tr>")
+    if not rows:
+        rows = f"<tr><td colspan='4' class='c'>{S(lang, 'no_deliveries')}</td></tr>"
+    paid_html = ""
+    if paid > 0:
+        paid_html = (f"<div class='total' style='font-size:14px'><span>{S(lang, 'paid')}</span><span>₹{_m(paid)}</span></div>"
+                     f"<div class='total' style='font-size:14px'><span>{S(lang, 'balance')}</span><span>₹{_m(total - paid)}</span></div>")
+    greet_html = f"<div class='greet'>{esc(cfg['greeting'])}</div>" if cfg["greeting"] else ""
+    notes_html = ""
+    if cfg["notes"]:
+        notes_html = (f"<div class='notes'><b>📢 {S(lang, 'notes_title')}</b><ul>"
+                      + "".join(f"<li>{esc(n)}</li>" for n in cfg["notes"]) + "</ul></div>")
+    actions_html = ""
+    if actions:
+        fn = re.sub(r"[^A-Za-z0-9_-]+", "_", str(filename)).strip("_") or "receipt"
+        actions_html = _RECEIPT_ACTIONS.replace("__FN__", fn).replace("__TITLE__", BILL_TITLE.replace("'", ""))
+    return f"""<html><head><meta charset='utf-8'><style>{_RECEIPT_CSS}</style></head><body><div class='card' id='rcpt'>
+<h2>{esc(title_of(lang))}</h2><div class='sub'>{S(lang, 'monthly_bill', month='<b>' + esc(month_label) + '</b>')}</div>{greet_html}<hr>
+<div style='font-size:13px'><b>{S(lang, 'customer_name')}:</b> {esc(name)}<br><b>{S(lang, 'phone')}:</b> {esc(phone or 'N/A')}</div><hr>
+<table><tr><th>{S(lang, 'col_product')}</th><th class='c'>{S(lang, 'col_days')}</th><th class='r'>{S(lang, 'col_rate')}</th><th class='r'>{S(lang, 'col_total')}</th></tr>{rows}</table><hr>{daily_html}
+<div class='total'><span>{S(lang, 'total_bill')}</span><span>₹{_m(total)}</span></div>{paid_html}
+<div class='pay'><b>📲 {S(lang, 'pay_notice')}:</b><br>{esc(S(lang, 'upi_msg'))}<div class='upi'>{S(lang, 'upi_line')}: {esc(UPI_NUMBER)} ({esc(UPI_NAME)})</div></div>
+{notes_html}<div style='font-size:12px'><b>{S(lang, 'contact')}:</b> {esc(CONTACT_NUMBERS)}</div>
+<div class='foot'>{esc(S(lang, 'footer', num=UPI_NUMBER))}</div></div>{actions_html}</body></html>"""
+
+
+_SLIP_CSS = """
+*{box-sizing:border-box}
+body{font-family:'Noto Sans Tamil','Nirmala UI','Latha',Arial,Helvetica,sans-serif;margin:0;background:#e5e7eb;color:#111}
+.bar{position:sticky;top:0;background:#1e293b;color:#fff;padding:8px 12px;font-size:13px;display:flex;gap:12px;align-items:center}
+.bar button{background:#4f46e5;color:#fff;border:0;border-radius:6px;padding:6px 14px;font-weight:700;cursor:pointer}
+.page{width:210mm;height:297mm;padding:8mm;margin:10px auto;background:#fff;display:grid;
+      grid-template-columns:1fr 1fr;grid-template-rows:repeat(4,1fr);gap:4mm;box-shadow:0 1px 6px #0004}
+.slip{border:1.5px solid #4f46e5;border-radius:6px;padding:2.5mm 3mm;font-size:8.5pt;overflow:hidden;
+      display:flex;flex-direction:column}
+.ttl{text-align:center;font-weight:700;color:#4f46e5;border-bottom:1px solid #4f46e5;padding-bottom:1mm;margin-bottom:1.5mm}
+.nm{font-weight:700;margin-bottom:1mm}.items{flex:1}.ln{margin:.6mm 0}
+.tot{display:flex;justify-content:space-between;font-weight:700;border-top:1px solid #4f46e5;padding-top:1mm;margin-top:1mm}
+.pay{background:#f0fdfa;border:1px solid #99f6e4;text-align:center;font-size:6.5pt;padding:.8mm;margin-top:1mm}
+.ft{text-align:center;font-size:6pt;margin-top:.8mm}
+@page{size:A4;margin:0}
+@media print{
+  body{background:#fff}.bar{display:none}
+  .page{margin:0;box-shadow:none;page-break-after:always;break-after:page}
+  .page:last-child{page-break-after:auto;break-after:auto}
+}
+"""
+
+
+def slip_html(name, items, total, paid, month_label, lang="en"):
+    lines = ""
+    for it in items:
+        extra = f" <i>[{it['extra']:g} {S(lang, 'extra')}]</i>" if it["extra"] > 0 else ""
+        lines += (f"<div class='ln'>• <b>{brand_span(it['item'], lang)}:</b> {_days(it['days'], lang)} "
+                  f"({it['total']:g} {S(lang, 'pkts')} × ₹{_m(_rate(it))} = ₹{_m(it['amount'])}){extra}</div>")
+    paid_line = ""
+    if paid > 0:
+        paid_line = (f"<div class='tot' style='border:0;font-weight:400'><span>{S(lang, 'paid')} ₹{_m(paid)}</span>"
+                     f"<span>{S(lang, 'balance')} ₹{_m(total - paid)}</span></div>")
+    notes = " • ".join(RCFG[lang]["notes"])
+    notes_line = f"<div class='ft' style='font-weight:700'>📢 {esc(notes[:150])}</div>" if notes else ""
+    return (f"<div class='slip'><div class='ttl'>{esc(title_of(lang))} ({esc(month_label)})</div>"
+            f"<div class='nm'>{S(lang, 'name')}: {esc(name)}</div><div class='items'>{lines}</div>"
+            f"<div class='tot'><span>{S(lang, 'total_wa')}:</span><span>₹{_m(total)}</span></div>{paid_line}"
+            f"<div class='pay'>{S(lang, 'upi_line')}: {esc(UPI_NUMBER)} ({esc(UPI_NAME)})<br>{S(lang, 'slip_pay')}</div>{notes_line}"
+            f"<div class='ft'>{esc(S(lang, 'slip_footer', num=CONTACT_NUMBERS))}</div></div>")
+
+
+def slips_document(entries, month_label, lang="en"):
+    """entries: [(name, items, total, paid)] -> printable A4 HTML, SLIPS_PER_PAGE per page."""
+    pages = ""
+    for i in range(0, len(entries), SLIPS_PER_PAGE):
+        chunk = entries[i:i + SLIPS_PER_PAGE]
+        pages += "<div class='page'>" + "".join(slip_html(n, it, tot, pd_, month_label, lang) for n, it, tot, pd_ in chunk) + "</div>"
+    return (f"<html><head><meta charset='utf-8'><title>Bill slips {esc(month_label)}</title><style>{_SLIP_CSS}</style></head><body>"
+            f"<div class='bar'><button onclick='window.print()'>🖨️ Print A4</button>"
+            f"<span>{len(entries)} slips · {SLIPS_PER_PAGE} per page · In the print dialog set Margins = None</span></div>{pages}</body></html>")
 
 # ---------------- Session State Initialization ----------------
 if "authenticated" not in st.session_state:
@@ -34,40 +380,53 @@ if "app_lang" not in st.session_state:
 def t(en_text, ta_text):
     return ta_text if st.session_state.get("app_lang", "English") == "தமிழ்" else en_text
 
-# ---------------- Login Screen ----------------
-if not st.session_state["authenticated"]:
-    st.markdown("""
-    <style>
-    .login-header { text-align: center; margin-top: 30px; font-weight: bold; }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown(f'<h2 class="login-header">{t("🔐 Login to Delivery System", "🔐 விநியோக அமைப்பில் உள்நுழைக")}</h2>', unsafe_allow_html=True)
-        st.markdown("---")
-        with st.form("login_form"):
-            username = st.text_input(t("Username", "பயனர் பெயர்"))
-            password = st.text_input(t("Password", "கடவுச்சொல்"), type="password")
-            submitted = st.form_submit_button(t("🔑 Login", "🔑 உள்நுழைக"), type="primary", use_container_width=True)
-            
-            if submitted:
-                if username in USER_CREDENTIALS and USER_CREDENTIALS[username] == password:
-                    st.session_state["authenticated"] = True
-                    st.session_state["username"] = username
-                    st.toast(t("✅ Login successful!", "✅ வெற்றிகரமாக உள்நுழைந்துள்ளீர்கள்!"), icon="🎉")
-                    st.rerun()
-                else:
-                    st.error(t("❌ Invalid Username or Password", "❌ தவறான பயனர் பெயர் அல்லது கடவுச்சொல்"))
-    st.stop()
-
-# ---------------- Custom CSS ----------------
+# ---------------- Minimal Clean Styling ----------------
 st.markdown("""
 <style>
-.main-title {font-size: 32px; font-weight: bold;}
-.custom-banner {padding: 12px 20px; border-radius: 8px; background: linear-gradient(90deg, #4CAF50, #2E7D32); color: white; font-weight: 600; margin-bottom: 15px;}
-.warn-banner {padding: 12px 20px; border-radius: 8px; background: linear-gradient(90deg, #FF9800, #EF6C00); color: white; font-weight: 600; margin-bottom: 15px;}
-
+.stApp {
+    background: linear-gradient(180deg, #e0e7ff 0%, #f8fafc 260px);
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+.main-title {
+    font-size: 26px;
+    font-weight: 700;
+    color: #1e293b;
+    margin-bottom: 5px;
+}
+.block-container {
+    padding-top: 4rem;
+    padding-bottom: 1.5rem;
+}
+.stButton>button {
+    border-radius: 6px;
+    font-weight: 600;
+}
+.main-banner {
+    background: linear-gradient(90deg, #4f46e5, #0ea5e9);
+    color: #ffffff;
+    padding: 14px 22px;
+    border-radius: 12px;
+    font-size: 26px;
+    font-weight: 800;
+    box-shadow: 0 4px 14px #4f46e540;
+}
+[data-testid="stSidebar"] { background: linear-gradient(180deg, #312e81 0%, #4338ca 60%, #0ea5e9 100%); }
+[data-testid="stSidebar"] * { color: #ffffff !important; }
+[data-testid="stSidebar"] code { color: #1e293b !important; background: #e0e7ff !important; }
+[data-testid="stSidebar"] .stButton>button { background: #ffffff25; border: 1px solid #ffffff88; }
+[data-testid="stMetric"] {
+    background: #ffffff; border-radius: 12px; padding: 14px 16px;
+    border-left: 6px solid #4f46e5; box-shadow: 0 2px 8px #0f172a14;
+}
+[data-testid="stHorizontalBlock"] > div:nth-child(2) [data-testid="stMetric"] { border-left-color: #0ea5e9; }
+[data-testid="stHorizontalBlock"] > div:nth-child(3) [data-testid="stMetric"] { border-left-color: #10b981; }
+[data-testid="stHorizontalBlock"] > div:nth-child(4) [data-testid="stMetric"] { border-left-color: #f59e0b; }
+.stApp h3 { color: #3730a3; }
+[data-testid="stExpander"] { background: #ffffff; border-radius: 10px; border: 1px solid #c7d2fe; }
+button[kind="primary"], [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {
+    background: linear-gradient(90deg, #4f46e5, #7c3aed) !important; border: 0 !important; color: #ffffff !important;
+}
+.stTabs [aria-selected="true"] { color: #4f46e5 !important; }
 @media print {
     body { background: white; color: black; margin: 0; padding: 0; }
     .no-print { display: none !important; }
@@ -78,20 +437,39 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Top Bar Header with Language Selector
+# ---------------- Login Screen ----------------
+if not st.session_state["authenticated"]:
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown(f'<h2>{t("🔐 Login to Delivery System", "🔐 விநியோக அமைப்பில் உள்நுழைக")}</h2>', unsafe_allow_html=True)
+        st.markdown("---")
+        with st.form("login_form"):
+            username = st.text_input(t("Username", "பயனர் பெயர்"))
+            password = st.text_input(t("Password", "கடவுச்சொல்"), type="password")
+            submitted = st.form_submit_button(t("🔑 Login", "🔑 உள்நுழைக"), type="primary", use_container_width=True)
+
+            if submitted:
+                if username in USER_CREDENTIALS and USER_CREDENTIALS[username] == password:
+                    st.session_state["authenticated"] = True
+                    st.session_state["username"] = username
+                    st.toast(t("✅ Login successful!", "✅ வெற்றிகரமாக உள்நுழைந்துள்ளீர்கள்!"), icon="🎉")
+                    st.rerun()
+                else:
+                    st.error(t("❌ Invalid Username or Password", "❌ தவறான பயனர் பெயர் அல்லது கடவுச்சொல்"))
+    st.stop()
+
+# Top Bar Header
 top_col1, top_col2 = st.columns([3, 1])
 with top_col1:
-    st.markdown(f'<div class="main-title">{t("🥛 Milk & Curd Delivery Management", "🥛 பால் & தயிர் விநியோக மேலாண்மை")}</div>', unsafe_allow_html=True)
-    st.caption(t("Multi-Brand Customer Management • Dynamic Add Buttons • Dual Language Billing • Profit Tracking", 
-                 "வாடிக்கையாளர் மேலாண்மை • தமிழ் & ஆங்கில பில்லிங் • லாப கணக்கீடு"))
+    st.markdown(f'<div class="main-banner">{t("🥛 Milk & Curd Delivery Management", "🥛 பால் & தயிர் விநியோக மேலாண்மை")}</div>', unsafe_allow_html=True)
 
 with top_col2:
     st.radio("🌐 Language / மொழி", ["English", "தமிழ்"], key="app_lang", horizontal=True)
 
 menu_options_en = ["🏠 Dashboard", "⚙ Item Rates", "👥 Customers", "🥛 Daily Delivery", "🧾 Billing & Receipts", "💵 Payments", "📊 Reports"]
 menu_options_ta = ["🏠 டாஷ்போர்டு", "⚙️ பொருள் விலைகள்", "👥 வாடிக்கையாளர்கள்", "🥛 தினசரி விநியோகம்", "🧾 பில் & ரசீதுகள்", "💵 செலுத்திய தொகைகள்", "📊 அறிக்கைகள்"]
+menu_keys = ["Dashboard", "Item Rates", "Customers", "Daily Delivery", "Billing & Receipts", "Payments", "Reports"]
 
-# Sidebar Menu & Logout Button
 with st.sidebar:
     st.markdown(f"👤 **{t('User', 'பயனர்')}:** `{st.session_state.get('username', 'admin')}`")
     if st.button(t("🚪 Logout", "🚪 வெளியேறு"), use_container_width=True):
@@ -100,26 +478,10 @@ with st.sidebar:
     st.markdown("---")
 
 menu_selection = st.sidebar.radio("Menu / மெனு", menu_options_ta if st.session_state.app_lang == "தமிழ்" else menu_options_en)
+_all_options = dict(zip(menu_options_en, menu_keys)) | dict(zip(menu_options_ta, menu_keys))
+menu = _all_options.get(menu_selection, "Reports")
 
-# Normalize Menu Key
-if menu_selection in [menu_options_en[0], menu_options_ta[0]]:
-    menu = "Dashboard"
-elif menu_selection in [menu_options_en[1], menu_options_ta[1]]:
-    menu = "Item Rates"
-elif menu_selection in [menu_options_en[2], menu_options_ta[2]]:
-    menu = "Customers"
-elif menu_selection in [menu_options_en[3], menu_options_ta[3]]:
-    menu = "Daily Delivery"
-elif menu_selection in [menu_options_en[4], menu_options_ta[4]]:
-    menu = "Billing & Receipts"
-elif menu_selection in [menu_options_en[5], menu_options_ta[5]]:
-    menu = "Payments"
-else:
-    menu = "Reports"
 
-item_rates = get_item_rates()
-
-# Helper for Date Range Selection
 def render_date_range_picker(key_prefix="dash"):
     calc_mode = st.radio(
         t("Calculation Mode / கணக்கீட்டு முறை", "Calculation Mode / கணக்கீட்டு முறை"),
@@ -131,7 +493,7 @@ def render_date_range_picker(key_prefix="dash"):
         horizontal=True,
         key=f"{key_prefix}_mode"
     )
-    
+
     today = date.today()
     if "Single" in calc_mode or "ஒரு நாள்" in calc_mode:
         selected_date = st.date_input(t("Select Date", "தேதியை தேர்ந்தெடுக்கவும்"), value=today, key=f"{key_prefix}_single_date")
@@ -149,118 +511,435 @@ def render_date_range_picker(key_prefix="dash"):
         )
         year_val = col_y.number_input(t("Select Year", "ஆண்டு"), min_value=2020, max_value=2035, value=today.year, key=f"{key_prefix}_year_sel")
         last_day = calendar.monthrange(year_val, month_idx)[1]
-        
+
         s_date = f"{year_val:04d}-{month_idx:02d}-01"
         e_date = f"{year_val:04d}-{month_idx:02d}-{last_day:02d}"
         period_label = f"01 to {last_day} {datetime(2000, month_idx, 1).strftime('%B')} {year_val}"
     else:
         col_s, col_e = st.columns(2)
-        s_val = col_s.date_input(t("From Date (e.g. 1st)", "தொடங்கும் தேதி (எ.கா. 1)"), value=today.replace(day=1), key=f"{key_prefix}_sdate")
-        e_val = col_e.date_input(t("To Date (e.g. 30th)", "முடிவடையும் தேதி (எ.கா. 30)"), value=today, key=f"{key_prefix}_edate")
+        s_val = col_s.date_input(t("From Date", "தொடங்கும் தேதி"), value=today.replace(day=1), key=f"{key_prefix}_sdate")
+        e_val = col_e.date_input(t("To Date", "முடிவடையும் தேதி"), value=today, key=f"{key_prefix}_edate")
+        if e_val < s_val:
+            st.error(t("'To Date' must be on or after 'From Date'.", "'முடிவடையும் தேதி' தொடக்க தேதிக்குப் பின் இருக்க வேண்டும்."))
+            st.stop()
         s_date = s_val.isoformat()
         e_date = e_val.isoformat()
         period_label = f"{s_val.strftime('%d-%b-%Y')} to {e_val.strftime('%d-%b-%Y')}"
 
     return s_date, e_date, period_label
 
+
+def _fmt_items(entries):
+    """[(item, qty, extra)] -> '2 Aavin250 + 2 Nanjil130 (+1 extra)'."""
+    order = {item: i for i, item in enumerate(AVAILABLE_ITEMS)}
+    entries = sorted(entries, key=lambda e: order.get(e[0], 999))
+    return " + ".join(f"{q:g} {item_code(i)}" + (f" (+{e:g} extra)" if e else "") for i, q, e in entries)
+
+
+def build_customer_matrix(s_date, e_date, customers_list):
+    """Customer x Date table. Each cell shows brand codes, e.g. '2A250 + 2N130'."""
+    ids = [c[0] for c in customers_list]
+    names = [c[1] for c in customers_list]
+    all_dates = [d.strftime("%Y-%m-%d") for d in pd.date_range(s_date, e_date)]
+    show_days = len(all_dates) <= 62  # for very long ranges show totals only
+
+    cell, per_item = {}, {}
+    total = {cid: 0.0 for cid in ids}
+    extra = {cid: 0.0 for cid in ids}
+    for cid, d, item, qty, ex in get_customer_date_totals(s_date, e_date):
+        cell.setdefault((cid, d), []).append((item, qty, ex))
+        pi = per_item.setdefault(cid, {})
+        q0, e0 = pi.get(item, (0.0, 0.0))
+        pi[item] = (q0 + qty, e0 + ex)
+        if cid in total:
+            total[cid] += qty
+            extra[cid] += ex
+
+    data = {"Customer Name": names}
+    if show_days:
+        same_month = all_dates[0][:7] == all_dates[-1][:7]
+        fmt = "%d" if same_month else "%d %b"
+        for d in all_dates:
+            label = datetime.strptime(d, "%Y-%m-%d").strftime(fmt)
+            data[label] = [_fmt_items(cell.get((cid, d), [])) for cid in ids]
+    data["Total"] = [total[cid] for cid in ids]
+    data["Extra"] = [extra[cid] for cid in ids]
+    data["Items Summary"] = [_fmt_items([(i, q, e) for i, (q, e) in per_item.get(cid, {}).items()]) for cid in ids]
+    return pd.DataFrame(data)
+
+
+def receipt_message_panel(month_key):
+    """Asks the owner what to print on this month's receipts (greeting + new brand / offer / notice).
+    Saved text is loaded into RCFG, which receipt_html / whatsapp_message / slip_html read."""
+    cfg = get_settings_by_prefix("receipt_")
+    val = lambda k: cfg[k] if cfg.get(k) is not None else DEFAULT_MSG[k]
+    confirmed = cfg.get("receipt_confirmed_month") == month_key
+    ITEM_TA.clear()
+    ITEM_TA.update(get_item_tamil_names())
+
+    if not confirmed:
+        st.warning(t("📢 Anything NEW this month – a new brand, an offer, a holiday / price notice? "
+                     "Type it below and press Save. If nothing changed, press 'Keep the same'. It is printed on every receipt & WhatsApp message.",
+                     "📢 இந்த மாதம் புதிதாக ஏதாவது உள்ளதா - புதிய பிராண்ட், சலுகை, விடுமுறை / விலை அறிவிப்பு? "
+                     "கீழே எழுதி Save அழுத்தவும். மாற்றம் இல்லையெனில் 'Keep the same' அழுத்தவும். இது ஒவ்வொரு ரசீது & வாட்ஸ்அப்பிலும் வரும்."))
+    with st.expander(t("📢 Greeting & announcements on receipts / WhatsApp", "📢 ரசீது / வாட்ஸ்அப்பில் வரும் வாழ்த்து & அறிவிப்புகள்"), expanded=not confirmed):
+        c_ta, c_en = st.columns(2)
+        g_ta = c_ta.text_area("தமிழ் வாழ்த்து (Tamil greeting)", value=val("receipt_greeting_ta"), key=f"rm_gta_{month_key}", height=110)
+        n_ta = c_ta.text_area("தமிழ் அறிவிப்புகள் - ஒரு வரிக்கு ஒன்று (Tamil announcements)", value=val("receipt_notes_ta"), key=f"rm_nta_{month_key}", height=150,
+                              help="e.g. புதிய பிராண்ட் ... கிடைக்கும் / தீபாவளி விடுமுறை அறிவிப்பு")
+        g_en = c_en.text_area("English greeting", value=val("receipt_greeting_en"), key=f"rm_gen_{month_key}", height=110)
+        n_en = c_en.text_area("English announcements - one per line", value=val("receipt_notes_en"), key=f"rm_nen_{month_key}", height=150,
+                              help="e.g. New brand ... now available")
+        b1, b2, _ = st.columns([2, 2, 3])
+        if b1.button(t("💾 Save message", "💾 சேமி"), type="primary", key=f"rm_save_{month_key}", use_container_width=True):
+            set_settings({"receipt_greeting_ta": g_ta.strip(), "receipt_notes_ta": n_ta.strip(),
+                          "receipt_greeting_en": g_en.strip(), "receipt_notes_en": n_en.strip(),
+                          "receipt_confirmed_month": month_key})
+            st.toast(t("Message saved!", "சேமிக்கப்பட்டது!"), icon="✅")
+            st.rerun()
+        if not confirmed and b2.button(t("✅ Keep the same", "✅ மாற்றம் இல்லை"), key=f"rm_keep_{month_key}", use_container_width=True):
+            set_settings({"receipt_confirmed_month": month_key})
+            st.rerun()
+        missing_ta = [i for i in AVAILABLE_ITEMS if has_untranslated_words(tamil_item(i, ITEM_TA))]
+        if missing_ta:
+            st.caption(t("These items have no Tamil name yet (Item Rates → Edit Item Name): ", "இவற்றுக்கு தமிழ் பெயர் இல்லை (Item Rates → Edit Item Name): ") + ", ".join(missing_ta))
+    for lg in ("ta", "en"):  # receipts use the SAVED text
+        RCFG[lg] = {"greeting": val(f"receipt_greeting_{lg}").strip(),
+                    "notes": [ln.strip() for ln in val(f"receipt_notes_{lg}").splitlines() if ln.strip()]}
+
+
+def statement_import_ui(customers):
+    """Upload a bank / PhonePe / GPay CSV -> table of received payments with the customer guessed -> record."""
+    msg = st.session_state.pop("stmt_msg", None)
+    if msg:
+        st.success(msg)
+    st.caption(t("Upload the CSV statement from your bank, PhonePe or GPay. Money RECEIVED is matched to customers by name / phone "
+                 "(names you confirm once are remembered). Check the table, correct anything wrong, then press Record - nothing is saved before that.",
+                 "வங்கி, PhonePe அல்லது GPay CSV ஐ பதிவேற்றவும். வரவு தொகை பெயர் / தொலைபேசி மூலம் வாடிக்கையாளருடன் பொருத்தப்படும். "
+                 "அட்டவணையை சரிபார்த்து Record அழுத்தவும் - அதுவரை எதுவும் சேமிக்கப்படாது."))
+    up = st.file_uploader(t("Statement file (.csv)", "ஸ்டேட்மெண்ட் கோப்பு (.csv)"), type=["csv", "txt"], key="stmt_file")
+    if up is None:
+        return
+    raw = up.getvalue()
+    try:
+        df_raw = read_statement(raw)
+    except Exception as err:
+        st.error(t(f"Could not read this file: {err}", f"கோப்பை படிக்க முடியவில்லை: {err}"))
+        return
+    if df_raw.empty:
+        st.warning(t("The file has no rows.", "கோப்பில் வரிசைகள் இல்லை."))
+        return
+
+    fk = f"{up.name}_{up.size}"
+    none = "—"
+    guess = detect_columns(df_raw)
+    all_cols = list(df_raw.columns)
+    opts = [none] + all_cols
+    ix = lambda c: opts.index(c) if c in opts else 0
+    with st.expander(t("⚙️ Columns detected (change only if something looks wrong)", "⚙️ கண்டறிந்த நெடுவரிசைகள் (தவறாக இருந்தால் மட்டும் மாற்றவும்)")):
+        c1, c2, c3 = st.columns(3)
+        sel = {
+            "date": c1.selectbox(t("Date", "தேதி"), opts, index=ix(guess["date"]), key=f"sc_date_{fk}"),
+            "amount": c2.selectbox(t("Amount (single column)", "தொகை (ஒரே நெடுவரிசை)"), opts, index=ix(guess["amount"]), key=f"sc_amt_{fk}"),
+            "type": c3.selectbox(t("Type (Credit / Debit)", "வகை (Credit / Debit)"), opts, index=ix(guess["type"]), key=f"sc_type_{fk}"),
+        }
+        c4, c5, c6 = st.columns(3)
+        sel["credit"] = c4.selectbox(t("Credit / Deposit column", "வரவு நெடுவரிசை"), opts, index=ix(guess["credit"]), key=f"sc_cr_{fk}")
+        sel["debit"] = c5.selectbox(t("Debit / Withdrawal column", "செலவு நெடுவரிசை"), opts, index=ix(guess["debit"]), key=f"sc_dr_{fk}")
+        sel["ref"] = c6.selectbox(t("Reference / UTR / Txn ID", "குறிப்பு எண் / UTR"), opts, index=ix(guess["ref"]), key=f"sc_ref_{fk}")
+        desc_cols = st.multiselect(t("Details / narration column(s) - used to find the customer name", "விவரம் / narration நெடுவரிசை"),
+                                   all_cols, default=guess["desc"], key=f"sc_desc_{fk}")
+        st.dataframe(df_raw.head(5), use_container_width=True, hide_index=True)
+    cols = {k: (None if v == none else v) for k, v in sel.items()}
+    cols["desc"] = desc_cols
+    cols["status"] = guess["status"]
+
+    credits, info = parse_transactions(df_raw, cols)
+    st.caption(t(f"{len(df_raw)} rows read · {len(credits)} payments received · left out: {info['debits']} money-out, "
+                 f"{info['failed']} failed/pending, {info['no_date_or_amount']} without date/amount.",
+                 f"{len(df_raw)} வரிகள் · {len(credits)} வரவுகள் · தவிர்த்தவை: {info['debits']} செலவு, "
+                 f"{info['failed']} தோல்வி/நிலுவை, {info['no_date_or_amount']} தேதி/தொகை இல்லாதவை."))
+    if info["assumed_credit"]:
+        st.warning(t(f"In {info['assumed_credit']} rows the file does not say whether money came in or went out - they are treated as RECEIVED. Please check them.",
+                     f"{info['assumed_credit']} வரிகளில் வரவா செலவா என்று இல்லை - வரவாக எடுக்கப்பட்டுள்ளது. சரிபார்க்கவும்."))
+    if not credits:
+        st.info(t("No received payments found. Check the column settings above.", "வரவுகள் எதுவும் இல்லை. மேலுள்ள நெடுவரிசை அமைப்பை சரிபார்க்கவும்."))
+        return
+
+    # ---- what is already owed / already recorded ----
+    cust_list = [(c[0], c[1], c[2]) for c in customers]
+    id_to_name = {c[0]: c[1] for c in customers}
+    name_to_id = {n: i for i, n in id_to_name.items()}
+    aliases = get_payer_aliases()
+    month_keys = set()
+    for tx in credits:
+        for back in range(0, 4):
+            yy, mm = month_add(tx["date"].year, tx["date"].month, -back)
+            month_keys.add(f"{yy:04d}-{mm:02d}")
+    due_by_month = {mk: {r[0]: float(r[5]) - float(r[7]) for r in get_all_monthly_billing(mk)} for mk in sorted(month_keys)}
+    lo = min(tx["date"] for tx in credits).isoformat()
+    hi = max(tx["date"] for tx in credits).isoformat()
+    known_pay = {(c, d, round(a, 2)) for c, d, a, _ in get_payments_between(lo, hi)}
+    known_refs = get_existing_txn_refs(tuple(sorted({tx["ref"] for tx in credits if tx["ref"]})))
+
+    SKIP = t("— skip —", "— தவிர் —")
+    HOW = {"learned": t("Matched (remembered)", "பொருத்தம் (நினைவில்)"), "phone": t("Matched (phone)", "பொருத்தம் (போன்)"),
+           "name": t("Matched (name)", "பொருத்தம் (பெயர்)")}
+    rows, payer_keys, refs = [], [], []
+    for tx in credits:
+        payer = extract_payer(tx["desc"])
+        pm_y, pm_m = month_add(tx["date"].year, tx["date"].month, -1)
+        cid, how = match_customer(tx["desc"], payer, tx["amount"], cust_list, aliases, due_by_month.get(f"{pm_y:04d}-{pm_m:02d}"))
+        month = suggest_month(cid if cid else -1, tx["date"], due_by_month)
+        dup = False
+        if tx["ref"] and tx["ref"] in known_refs:
+            status, dup = t("Already recorded (same reference)", "ஏற்கனவே பதிவு (அதே குறிப்பு எண்)"), True
+        elif cid and (cid, tx["date"].isoformat(), round(tx["amount"], 2)) in known_pay:
+            status, dup = t("Looks already recorded", "ஏற்கனவே பதிவானது போல் உள்ளது"), True
+        elif cid:
+            status = HOW[how]
+        elif how == "ambiguous":
+            status = t("Several customers fit – pick one", "பல வாடிக்கையாளர்கள் - ஒருவரை தேர்வு செய்யவும்")
+        else:
+            status = t("No match – pick customer", "பொருத்தம் இல்லை - தேர்வு செய்யவும்")
+        method = "Bank Transfer" if re.search(r"neft|imps|rtgs", tx["desc"], re.I) else "UPI"
+        rows.append({"Record": bool(cid) and not dup, "Date": tx["date"].isoformat(), "Details": tx["desc"][:90],
+                     "Amount (₹)": float(tx["amount"]), "Customer": id_to_name.get(cid, SKIP), "Month": month,
+                     "Method": method, "Status": status})
+        payer_keys.append(norm_payer(payer))
+        refs.append(tx["ref"])
+
+    n_ok = sum(1 for r in rows if r["Record"])
+    st.markdown(f"**{len(rows)}** " + t("payments found", "வரவுகள்") + f" · ✅ **{n_ok}** " + t("ready to record (ticked)", "பதிவுக்கு தயார் (டிக் செய்தவை)"))
+    ver = st.session_state.setdefault("stmt_ver", 0)
+    with st.form(f"stmt_form_{fk}_{ver}"):
+        edited = st.data_editor(
+            pd.DataFrame(rows),
+            column_config={
+                "Record": st.column_config.CheckboxColumn(t("Record?", "பதிவு?")),
+                "Customer": st.column_config.SelectboxColumn(options=[SKIP] + list(name_to_id), required=True),
+                "Month": st.column_config.TextColumn(help="Bill month, YYYY-MM (the oldest unpaid month is suggested)"),
+                "Method": st.column_config.SelectboxColumn(options=["UPI", "Cash", "Bank Transfer"], required=True),
+                "Amount (₹)": st.column_config.NumberColumn(format="%.8g"),
+            },
+            disabled=["Date", "Details", "Amount (₹)", "Status"],
+            hide_index=True, use_container_width=True, num_rows="fixed", key=f"stmt_editor_{fk}_{ver}")
+        go = st.form_submit_button(t("💾 Record ticked payments", "💾 டிக் செய்த தொகைகளை பதிவு செய்"), type="primary", use_container_width=True)
+
+    if go:
+        to_save, alias_map, bad = [], {}, 0
+        for i, r in enumerate(edited.to_dict("records")):
+            if not r["Record"]:
+                continue
+            mk = str(r["Month"]).strip()
+            if r["Customer"] not in name_to_id or not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", mk):
+                bad += 1
+                continue
+            cid = name_to_id[r["Customer"]]
+            to_save.append({"cid": cid, "month": mk, "date": r["Date"], "amount": float(r["Amount (₹)"]), "method": r["Method"],
+                            "note": "Statement: " + str(r["Details"])[:80], "ref": refs[i]})
+            if len(payer_keys[i]) >= 3:
+                alias_map[payer_keys[i]] = cid
+        if bad:
+            st.error(t(f"{bad} ticked rows have no customer or a wrong month (use YYYY-MM, e.g. 2026-09). Fix them and press Record again.",
+                       f"{bad} வரிகளில் வாடிக்கையாளர் இல்லை அல்லது மாதம் தவறு (YYYY-MM). சரிசெய்து மீண்டும் அழுத்தவும்."))
+        elif not to_save:
+            st.info(t("Nothing ticked.", "எதுவும் டிக் செய்யப்படவில்லை."))
+        else:
+            saved, skipped = add_payments_bulk(to_save)
+            save_payer_aliases(alias_map)
+            st.session_state["stmt_ver"] = ver + 1
+            total_amt = sum(r["amount"] for r in to_save)
+            st.session_state["stmt_msg"] = t(f"✅ {saved} payments recorded (₹{_m(total_amt)}). " + (f"{skipped} skipped - already recorded." if skipped else ""),
+                                             f"✅ {saved} தொகைகள் பதிவு செய்யப்பட்டன (₹{_m(total_amt)}). " + (f"{skipped} ஏற்கனவே பதிவானவை." if skipped else ""))
+            st.rerun()
+
+
 # ---------------- Dashboard ----------------
 if menu == "Dashboard":
     st.subheader(t("Dashboard Overview", "டாஷ்போர்டு மேலோட்டம்"))
-    
     s_date, e_date, period_label = render_date_range_picker("dash")
-    st.info(f"📆 **{t('Selected Period:', 'தேர்ந்தெடுக்கப்பட்ட காலம்:')}** `{period_label}`")
 
     stats = get_dashboard_stats(s_date, e_date)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(t("Active Customers", "செயலில் உள்ள வாடிக்கையாளர்கள்"), stats["customers"])
     c2.metric(t("Delivered Customers", "பால் பெற்றவர்கள்"), stats["delivered"])
     c3.metric(t("No Milk Customers", "பால் வாங்காதவர்கள்"), stats["no_milk"])
-    c4.metric(t("Total Quantity (Pkts)", "மொத்த அளவு (பாக்கெட்டுகள்)"), f'{stats["litres"]:.2f}')
+    c4.metric(t("Total Quantity (Pkts)", "மொத்த அளவு"), f'{stats["litres"]:g}')
 
     st.markdown("---")
     f1, f2, f3 = st.columns(3)
-    f1.metric(t("Total Cost (₹)", "மொத்த வாங்கிய விலை (₹)"), f"₹{stats['total_cost']:,.2f}")
-    f2.metric(t("Total Revenue (₹)", "மொத்த விற்பனை (₹)"), f"₹{stats['total_sell']:,.2f}")
-    f3.metric(t("Net Profit Earned (₹)", "நிகர லாபம் (₹)"), f"₹{stats['profit']:,.2f}", delta=f"₹{stats['profit']:,.2f}")
+    f1.metric(t("Total Cost (₹)", "மொத்த வாங்கிய விலை (₹)"), f"₹{_m(stats['total_cost'])}")
+    f2.metric(t("Total Revenue (₹)", "மொத்த விற்பனை (₹)"), f"₹{_m(stats['total_sell'])}")
+    f3.metric(t("Net Profit Earned (₹)", "நிகர லாபம் (₹)"), f"₹{_m(stats['profit'])}")
+
+    x1, x2, x3 = st.columns(3)
+    x1.metric(t("➕ Extra Packets", "➕ கூடுதல் பாக்கெட்டுகள்"), f"{stats['extra_qty']:g}")
+    x2.metric(t("➕ Extra Revenue (₹)", "➕ கூடுதல் விற்பனை (₹)"), f"₹{_m(stats['extra_sell'])}")
+    x3.metric(t("Customers Who Took Extra", "கூடுதல் வாங்கியவர்கள்"), stats["extra_customers"])
 
     st.markdown("---")
-    
-    tab_brand, tab_daily = st.tabs([
-        t("🥛 Brand & Profit Breakdown", "🥛 பிராண்ட் மற்றும் லாப சுருக்கம்"),
-        t("📅 Day-by-Day (1 to 30/31) Calculation", "📅 நாள் வாரியான (1 முதல் 30/31) கணக்கீடு")
-    ])
 
-    with tab_brand:
+    # st.tabs() runs the code of EVERY tab on every click. A radio only runs the selected view,
+    # so the dashboard now does 1-2 queries instead of 5.
+    views = {
+        "brand": t("🥛 Brand Breakdown", "🥛 பிராண்ட் சுருக்கம்"),
+        "daily": t("📅 Day-by-Day", "📅 நாள் வாரியான"),
+        "extra": t("➕ Extra Milk Report", "➕ கூடுதல் பால் அறிக்கை"),
+        "customer": t("👥 Customer Monthly Report", "👥 வாடிக்கையாளர் மாதாந்திர அறிக்கை"),
+    }
+    view = st.radio("View", list(views), format_func=views.get, horizontal=True,
+                    key="dash_view", label_visibility="collapsed")
+
+    if view == "brand":
         breakdown = get_item_breakdown_by_date_range(s_date, e_date)
         if breakdown:
-            table_data = []
-            for b in breakdown:
-                table_data.append({
-                    t("Product / Brand", "பொருள் / பிராண்ட்"): b["item_name"],
-                    t("Delivered Qty (Pkts)", "விநியோகிக்கப்பட்ட அளவு"): f"{b['delivered_qty']:g}",
-                    t("Total Cost (₹)", "மொத்த அடக்க விலை (₹)"): f"₹{b['total_cost']:,.2f}",
-                    t("Total Revenue (₹)", "மொத்த விற்பனை (₹)"): f"₹{b['total_sell']:,.2f}",
-                    t("Net Profit (₹)", "நிகர லாபம் (₹)"): f"₹{b['profit']:,.2f}"
-                })
-            st.dataframe(table_data, use_container_width=True)
+            df = pd.DataFrame(breakdown).rename(columns={
+                "item_name": "Product", "normal_qty": "Normal Qty", "extra_qty": "Extra Qty",
+                "delivered_qty": "Total Qty", "undelivered_count": "No-Milk Entries",
+                "total_cost": "Cost (₹)", "total_sell": "Revenue (₹)", "extra_sell": "Extra Revenue (₹)", "profit": "Profit (₹)"
+            })
+            st.dataframe(style_brand(df, ["Product"]), use_container_width=True, hide_index=True, column_config=num_cfg(df))
         else:
-            st.info(t("No deliveries recorded for this period.", "இந்த காலத்தில் விநியோக பதிவுகள் இல்லை."))
+            st.info(t("No deliveries recorded.", "பதிவுகள் இல்லை."))
 
-    with tab_daily:
-        st.markdown(f"### 🗓 {t('Day-by-Day Breakdown for Selected Range', 'நாள் வாரியான விநியோக விபரம்')}")
+    elif view == "daily":
         daily_rows = get_daily_breakdown_by_date_range(s_date, e_date)
-        matrix = get_daily_brand_matrix(s_date, e_date)
-
         if daily_rows:
-            daily_table = []
-            for row in daily_rows:
-                d = row["delivery_date"]
-                b_map = matrix.get(d, {})
-                
-                entry = {
-                    t("Date", "தேதி"): d,
-                    t("Delivered Cust", "பால் பெற்றவர்கள்"): row["delivered_cust"],
-                    t("Total Qty (Pkts)", "மொத்த அளவு"): f"{row['delivered_qty']:g}",
-                    t("Cost (₹)", "செலவு (₹)"): f"₹{row['total_cost']:,.2f}",
-                    t("Revenue (₹)", "விற்பனை (₹)"): f"₹{row['total_sell']:,.2f}",
-                    t("Profit (₹)", "லாபம் (₹)"): f"₹{row['profit']:,.2f}"
-                }
-                
-                for item in AVAILABLE_ITEMS:
-                    entry[item] = f"{b_map.get(item, 0.0):g}"
-                
-                daily_table.append(entry)
-
-            st.dataframe(daily_table, use_container_width=True)
+            df = pd.DataFrame(daily_rows).rename(columns={
+                "delivery_date": "Date", "delivered_qty": "Total Qty", "extra_qty": "Extra Qty",
+                "delivered_cust": "Delivered Customers", "extra_cust": "Extra Customers",
+                "undelivered_cust": "No Milk Customers", "total_cost": "Cost (₹)",
+                "total_sell": "Revenue (₹)", "profit": "Profit (₹)"
+            })
+            st.dataframe(df, use_container_width=True, hide_index=True, column_config=num_cfg(df))
         else:
-            st.info(t("No day-by-day delivery records found for this period.", "தேர்ந்தெடுக்கப்பட்ட காலத்தில் நாள் வாரியான பதிவுகள் இல்லை."))
+            st.info(t("No records found.", "பதிவுகள் இல்லை."))
 
-    st.markdown(f'<div class="custom-banner">{t("🌟 Tip: Switch to Full Month mode to automatically calculate all days from 1 to 30/31!", "🌟 குறிப்பு: 1 முதல் 30/31 வரையிலான அனைத்து நாட்களையும் கணக்கிட முழு மாதம் முறையைத் தேர்ந்தெடுக்கவும்!")}</div>', unsafe_allow_html=True)
+    elif view == "extra":
+        extra_rows = get_extra_report(s_date, e_date)
+        if extra_rows:
+            df = pd.DataFrame(extra_rows)
+            st.markdown("**" + t("Extra packets by customer", "வாடிக்கையாளர் வாரியாக கூடுதல் பாக்கெட்டுகள்") + "**")
+            pivot = df.pivot_table(index="Customer", columns="Product", values="Extra Qty", aggfunc="sum", fill_value=0)
+            pivot["Total Extra"] = pivot.sum(axis=1)
+            pivot["Amount (₹)"] = df.groupby("Customer")["Amount (₹)"].sum()
+            pivot = pivot.loc[sorted(pivot.index, key=natural_sort_key)].reset_index()
+            st.dataframe(pivot, use_container_width=True, hide_index=True, column_config=num_cfg(pivot))
+
+            st.markdown("**" + t("Every extra entry", "ஒவ்வொரு கூடுதல் பதிவு") + "**")
+            st.dataframe(df, use_container_width=True, hide_index=True, column_config=num_cfg(df))
+        else:
+            st.info(t("No extra milk recorded in this period.", "இந்த காலத்தில் கூடுதல் பால் பதிவு இல்லை."))
+
+    else:
+        customers_list = get_customers(include_inactive=False)
+        if customers_list:
+            st.caption(t("Each cell = packets + brand name, e.g. 2 Nanjil130 = 2 packets of Nanjil Red 130ml. "
+                         "Blue = Aavin, Red = Nanjil Red, Green = Nanjil Green, Amber = mixed brands.",
+                         "ஒவ்வொரு கட்டமும் = பாக்கெட் + பிராண்ட் பெயர். எ.கா. 2 Nanjil130 = 2 நஞ்சில் 130ml. நீலம் = ஆவின், சிவப்பு = நஞ்சில், பச்சை = நஞ்சில் கிரீன்."))
+            cust_search = st.text_input(t("🔍 Search customer name", "🔍 வாடிக்கையாளர் பெயர் தேடு"), key="matrix_search").strip().lower()
+            if cust_search:
+                customers_list = [c for c in customers_list if cust_search in c[1].lower()]
+            mdf = build_customer_matrix(s_date, e_date, customers_list)
+            color_cols = [c for c in mdf.columns if c not in ("Customer Name", "Total", "Extra")]
+            st.dataframe(style_brand(mdf, color_cols), use_container_width=True, hide_index=True, column_config=num_cfg(mdf))
 
 # ---------------- Item Rates ----------------
 elif menu == "Item Rates":
-    st.subheader(t("Configure Cost & Selling Prices (₹ per item/packet)", "பொருள் அடக்க மற்றும் விற்பனை விலைகளை அமைக்குக (₹)"))
-    
-    with st.form("item_rates_form"):
-        st.markdown('<div style="max-height: 65vh; overflow-y: auto; padding-right: 10px;">', unsafe_allow_html=True)
-        new_rates = {}
-        for item in AVAILABLE_ITEMS:
-            curr_rates = item_rates.get(item, {"cost_price": 20.0, "sell_price": 25.0})
-            st.markdown(f"**🥛 {item}**")
-            col_cp, col_sp = st.columns(2)
-            cp_val = col_cp.number_input(f"{t('Cost Price / Buying (₹)', 'அடக்க விலை (₹)')} - {item}", min_value=0.0, value=float(curr_rates["cost_price"]), step=0.50, key=f"cp_{item}")
-            sp_val = col_sp.number_input(f"{t('Selling Price (₹)', 'விற்பனை விலை (₹)')} - {item}", min_value=0.0, value=float(curr_rates["sell_price"]), step=0.50, key=f"sp_{item}")
-            new_rates[item] = {"cost_price": cp_val, "sell_price": sp_val}
-            st.markdown("---")
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        submitted = st.form_submit_button(t("💾 Save Cost & Sell Rates", "💾 விலைகளை சேமிக்கவும்"), type="primary", use_container_width=True)
-        if submitted:
-            for item, r in new_rates.items():
-                set_item_rate(item, r["cost_price"], r["sell_price"])
-            st.toast(t("✅ Cost & Selling rates updated successfully!", "✅ அடக்க & விற்பனை விலைகள் புதுப்பிக்கப்பட்டன!"), icon="🎉")
-            st.success(t("Rates updated successfully!", "விலைகள் புதுப்பிக்கப்பட்டன!"))
-            st.rerun()
+    st.subheader(t("Configure Item Rates", "பொருள் அடக்க மற்றும் விற்பனை விலைகள்"))
+    item_rates = get_item_rates()
+
+    rates_data = []
+    for item in AVAILABLE_ITEMS:
+        curr = item_rates.get(item, DEFAULT_RATE)
+        rates_data.append({
+            "Item Name": item,
+            "Cost Price (₹)": float(curr["cost_price"]),
+            "Selling Price (₹)": float(curr["sell_price"])
+        })
+
+    df_rates = pd.DataFrame(rates_data)
+
+    with st.form("rates_form"):
+        edited_rates = st.data_editor(
+            df_rates,
+            column_config={
+                "Item Name": st.column_config.Column(disabled=True),
+                "Cost Price (₹)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.8g"),
+                "Selling Price (₹)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.8g")
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+        if st.form_submit_button(t("💾 Save Item Rates", "💾 விலைகளை சேமிக்கவும்"), type="primary"):
+            changes = {}
+            for _, row in edited_rates.iterrows():
+                item = row["Item Name"]
+                cp, sp = float(row["Cost Price (₹)"]), float(row["Selling Price (₹)"])
+                old = item_rates.get(item, DEFAULT_RATE)
+                if abs(old["cost_price"] - cp) > 1e-9 or abs(old["sell_price"] - sp) > 1e-9:
+                    changes[item] = (cp, sp)  # only touch what really changed
+            if changes:
+                set_item_rates(changes)
+                st.toast(t("Rates updated successfully!", "விலைகள் புதுப்பிக்கப்பட்டன!"), icon="🎉")
+                st.rerun()
+            else:
+                st.toast(t("No changes to save.", "மாற்றங்கள் இல்லை."), icon="ℹ️")
+
+    st.markdown("---")
+    st.markdown("### " + t("➕ Add New Item / Brand", "➕ புதிய பொருள் / பிராண்ட் சேர்க்க"))
+    if st.session_state.get("username") in ADMIN_USERS:
+        with st.form("add_item_form", clear_on_submit=True):
+            n_name = st.text_input(t("New item name *", "புதிய பொருளின் பெயர் *"), placeholder="e.g. Aavin Milk (1 Litre)")
+            ci, cj = st.columns(2)
+            n_cp = ci.number_input(t("Cost Price (₹)", "அடக்க விலை (₹)"), min_value=0.0, value=20.0, step=0.5)
+            n_sp = cj.number_input(t("Selling Price (₹)", "விற்பனை விலை (₹)"), min_value=0.0, value=25.0, step=0.5)
+            if st.form_submit_button(t("💾 Add Item", "💾 பொருளை சேர்க்க"), type="primary"):
+                try:
+                    add_item(n_name, n_cp, n_sp)
+                    st.toast(t("Item added!", "பொருள் சேர்க்கப்பட்டது!"), icon="🎉")
+                    st.rerun()
+                except ValueError as err:
+                    st.error(str(err))
+        st.caption(t("Tip: write names like the existing ones, e.g. 'Aavin Milk (1 Litre)'. "
+                     "Names containing 'Aavin' or 'Nanjil' get the blue / red colour; shop stock should contain '(Shop)'. "
+                     "The new item appears in every product list straight away.",
+                     "எ.கா. 'Aavin Milk (1 Litre)'. புதிய பொருள் அனைத்து பட்டியலிலும் உடனே தோன்றும்."))
+    else:
+        st.info(t("🔒 Only the admin can add new items.", "🔒 புதிய பொருட்களை நிர்வாகி (admin) மட்டுமே சேர்க்க முடியும்."))
+
+    st.markdown("---")
+    st.markdown("### " + t("✏️ Edit Item Name", "✏️ பொருளின் பெயரை திருத்து"))
+    if st.session_state.get("username") in ADMIN_USERS:
+        st.caption(t("The new name replaces the old one everywhere – customer lists, all past deliveries, bills and rates. "
+                     "The Tamil name is optional: it is printed on Tamil receipts / WhatsApp (leave blank to use the automatic Tamil).",
+                     "புதிய பெயர் எல்லா இடங்களிலும் மாறும் - வாடிக்கையாளர் பட்டியல், பழைய விநியோகங்கள், பில்கள், விலைகள். "
+                     "தமிழ் பெயர் விருப்பத்திற்குரியது - தமிழ் ரசீதில் அச்சாகும்."))
+        with st.form("rename_item_form", clear_on_submit=True):
+            r_old = st.selectbox(t("Item to edit", "திருத்த வேண்டிய பொருள்"), AVAILABLE_ITEMS)
+            r_new = st.text_input(t("New item name (leave blank to keep)", "புதிய பெயர் (மாற்ற வேண்டாமெனில் காலியாக விடவும்)"),
+                                  placeholder="e.g. Aavin Milk (250 ml)")
+            r_ta = st.text_input(t("Tamil name for receipts (optional)", "தமிழ் பெயர் (விருப்பம்)"), placeholder="ஆவின் பால் (250 மி.லி)")
+            if st.form_submit_button(t("💾 Save Item Name", "💾 பெயரை சேமி"), type="primary"):
+                try:
+                    target = r_old
+                    new_clean = " ".join(r_new.split())
+                    if new_clean and new_clean != r_old:
+                        rename_item(r_old, new_clean)
+                        target = new_clean
+                        purge_item_widgets()
+                    if r_ta.strip():
+                        set_item_tamil_name(target, r_ta)
+                    if target == r_old and not r_ta.strip():
+                        st.toast(t("Nothing to change.", "மாற்றம் இல்லை."), icon="ℹ️")
+                    else:
+                        st.toast(t("Item updated!", "பொருள் புதுப்பிக்கப்பட்டது!"), icon="✅")
+                        st.rerun()
+                except ValueError as err:
+                    st.error(str(err))
+    else:
+        st.info(t("🔒 Only the admin can edit item names.", "🔒 பொருள் பெயர்களை நிர்வாகி (admin) மட்டுமே திருத்த முடியும்."))
 
 # ---------------- Customers ----------------
 elif menu == "Customers":
@@ -268,604 +947,608 @@ elif menu == "Customers":
     tab1, tab2 = st.tabs([t("➕ Add Customer", "➕ வாடிக்கையாளர் சேர்க்க"), t("📋 Customer List", "📋 வாடிக்கையாளர் பட்டியல்")])
 
     with tab1:
-        st.markdown(f"### {t('Add New Customer', 'புதிய வாடிக்கையாளரை சேர்க்க')}")
-        
-        if st.session_state.get("reset_cust_form", False):
-            for k in list(st.session_state.keys()):
-                if k.startswith("new_cust_") or k.startswith("add_it_") or k.startswith("add_qty_"):
-                    del st.session_state[k]
-            st.session_state.add_items_list = [{"item": AVAILABLE_ITEMS[0], "qty": 1.0}]
-            st.session_state.reset_cust_form = False
+        if "add_cust_items" not in st.session_state:
+            st.session_state["add_cust_items"] = [{"item": AVAILABLE_ITEMS[0], "qty": 1.0}]
 
-        if "add_items_list" not in st.session_state:
-            st.session_state.add_items_list = [{"item": AVAILABLE_ITEMS[0], "qty": 1.0}]
+        name = st.text_input(t("Customer Name *", "வாடிக்கையாளர் பெயர் *"))
+        phone = st.text_input(t("Phone", "தொலைபேசி எண்"))
+        active = st.checkbox(t("Active Customer", "செயலில் உள்ள வாடிக்கையாளர்"), value=True)
 
-        name = st.text_input(t("Customer name *", "வாடிக்கையாளர் பெயர் *"), key="new_cust_name")
-        phone = st.text_input(t("Phone", "தொலைபேசி எண்"), key="new_cust_phone")
-        address = st.text_input(t("Address", "முகவரி"), key="new_cust_address")
-        active = st.checkbox(t("Active customer", "செயலில் உள்ள வாடிக்கையாளர்"), value=True, key="new_cust_active")
+        st.markdown("### " + t("Assigned Products / Brands", "ஒதுக்கப்பட்ட பொருட்கள் / பிராண்டுகள்"))
 
-        st.markdown(f"#### {t('Default Products / Brands', 'வழக்கமான பொருட்கள் / பிராண்டுகள்')}")
-        for idx, itm in enumerate(st.session_state.add_items_list):
-            c1, c2, c3 = st.columns([3, 2, 1])
-            default_idx = AVAILABLE_ITEMS.index(itm["item"]) if itm["item"] in AVAILABLE_ITEMS else 0
-            item_sel = c1.selectbox(f"{t('Product', 'பொருள்')} #{idx+1}", AVAILABLE_ITEMS, index=default_idx, key=f"add_it_{idx}")
-            qty_inp = c2.number_input(f"{t('Quantity', 'அளவு')} #{idx+1}", min_value=0.0, value=float(itm["qty"]), step=1.0, key=f"add_qty_{idx}")
-            
-            st.session_state.add_items_list[idx]["item"] = item_sel
-            st.session_state.add_items_list[idx]["qty"] = qty_inp
+        items_to_remove = []
+        for idx, item_entry in enumerate(st.session_state["add_cust_items"]):
+            c1, c2, c3 = st.columns([4, 2, 1])
+            curr_item_idx = AVAILABLE_ITEMS.index(item_entry["item"]) if item_entry["item"] in AVAILABLE_ITEMS else 0
 
-            if len(st.session_state.add_items_list) > 1:
-                if c3.button("❌", key=f"rem_add_{idx}"):
-                    st.session_state.add_items_list.pop(idx)
-                    st.rerun()
+            selected_item = c1.selectbox(f"{t('Product', 'பொருள்')} #{idx+1}", AVAILABLE_ITEMS, index=curr_item_idx, key=f"cust_add_item_{idx}")
+            selected_qty = c2.number_input(f"{t('Quantity', 'அளவு')} #{idx+1}", min_value=1, value=max(int(round(item_entry["qty"])), 1), step=1, key=f"cust_add_qty_{idx}")
 
-        if st.button(t("➕ Add Another Brand/Product", "➕ மற்றொரு பிராண்ட் சேர்க்க"), key="btn_add_brand_new"):
-            st.session_state.add_items_list.append({"item": AVAILABLE_ITEMS[0], "qty": 1.0})
+            st.session_state["add_cust_items"][idx]["item"] = selected_item
+            st.session_state["add_cust_items"][idx]["qty"] = selected_qty
+
+            if len(st.session_state["add_cust_items"]) > 1:
+                if c3.button("❌", key=f"remove_cust_item_{idx}"):
+                    items_to_remove.append(idx)
+
+        if items_to_remove:
+            for i in sorted(items_to_remove, reverse=True):
+                st.session_state["add_cust_items"].pop(i)
+            st.rerun()
+
+        if st.button(t("➕ Add Another Product / Brand", "➕ மற்றொரு பொருள் சேர்க்க")):
+            st.session_state["add_cust_items"].append({"item": AVAILABLE_ITEMS[0], "qty": 1.0})
             st.rerun()
 
         st.markdown("---")
-        if st.button(t("💾 Save Customer", "💾 வாடிக்கையாளரை சேமிக்கவும்"), type="primary", key="btn_save_new_cust"):
-            if not name.strip():
-                st.error(t("Customer name is required.", "வாடிக்கையாளர் பெயர் அவசியம்."))
-            else:
-                items_to_save = [(x["item"], x["qty"]) for x in st.session_state.add_items_list]
-                add_customer(name.strip(), phone.strip(), address.strip(), items_to_save, active)
-                
-                st.session_state.reset_cust_form = True
-                st.toast(t("✅ Customer saved successfully!", "✅ வாடிக்கையாளர் சேமிக்கப்பட்டார்!"), icon="🎉")
-                st.success(t("Customer added successfully.", "வாடிக்கையாளர் வெற்றிகரமாக சேர்க்கப்பட்டார்."))
+        if st.button(t("💾 Save Customer", "💾 சேமிக்கவும்"), type="primary", use_container_width=True):
+            if name.strip():
+                assigned_items = [(x["item"], x["qty"]) for x in st.session_state["add_cust_items"]]
+                add_customer(name.strip(), phone.strip(), "", assigned_items, active)
+                reset_daily_sheets()
+
+                st.session_state["add_cust_items"] = [{"item": AVAILABLE_ITEMS[0], "qty": 1.0}]
+                st.toast(t("Customer added successfully!", "வாடிக்கையாளர் சேர்க்கப்பட்டார்!"), icon="🎉")
                 st.rerun()
+            else:
+                st.error(t("Customer name required", "பெயர் கட்டாயம்"))
 
     with tab2:
         customers = get_customers(include_inactive=True)
-        if not customers:
-            st.info(t("No customers added yet.", "வாடிக்கையாளர்கள் இல்லை."))
-        else:
+        if customers:
+            items_map = get_all_customer_items()  # cached single query
+
+            table_data = []
             for c in customers:
-                cid, name, phone, address, active, created = c
-                cust_items = get_customer_items(cid)
-                items_summary = " | ".join([f"{i['item_name']} ({i['normal_qty']:g}/{t('day', 'நாள்')})" for i in cust_items])
-                
-                with st.expander(f"{name} — {items_summary} {'🟢' if active else '🔴'}"):
-                    ename = st.text_input(t("Name", "பெயர்"), value=name, key=f"n_{cid}")
-                    ephone = st.text_input(t("Phone", "தொலைபேசி"), value=phone or "", key=f"p_{cid}")
-                    eaddress = st.text_input(t("Address", "முகவரி"), value=address or "", key=f"a_{cid}")
-                    eactive = st.checkbox(t("Active", "செயலில் உள்ளவர்"), value=bool(active), key=f"ac_{cid}")
-                    
-                    edit_key = f"edit_items_{cid}"
-                    if edit_key not in st.session_state:
-                        st.session_state[edit_key] = [{"item": ci["item_name"], "qty": ci["normal_qty"]} for ci in cust_items] if cust_items else [{"item": AVAILABLE_ITEMS[0], "qty": 1.0}]
+                cid, cname, cphone, _, cactive, _ = c
+                its = items_map.get(cid, [])
+                table_data.append({
+                    "ID": cid,
+                    "Customer Name": cname,
+                    "Phone": cphone or "-",
+                    "Default Products / Brands": " | ".join(i for i, _ in its) if its else "None",
+                    "Default Quantity": " | ".join(f"{q:g}" for _, q in its) if its else "0",
+                    "Active Status": "Active" if cactive == 1 else "Inactive"
+                })
 
-                    st.markdown(f"##### {t('Customer Products / Brands', 'பொருட்கள் / பிராண்டுகள்')}")
-                    for idx, itm in enumerate(st.session_state[edit_key]):
-                        c1, c2, c3 = st.columns([3, 2, 1])
-                        ed_default_idx = AVAILABLE_ITEMS.index(itm["item"]) if itm["item"] in AVAILABLE_ITEMS else 0
-                        st.session_state[edit_key][idx]["item"] = c1.selectbox(f"{t('Product', 'பொருள்')} #{idx+1}", AVAILABLE_ITEMS, index=ed_default_idx, key=f"ed_it_{cid}_{idx}")
-                        st.session_state[edit_key][idx]["qty"] = c2.number_input(f"{t('Qty', 'அளவு')} #{idx+1}", min_value=0.0, value=float(itm["qty"]), step=1.0, key=f"ed_qty_{cid}_{idx}")
-                        if len(st.session_state[edit_key]) > 1:
-                            if c3.button("❌", key=f"rem_ed_{cid}_{idx}"):
-                                st.session_state[edit_key].pop(idx)
-                                st.rerun()
+            list_search = st.text_input(t("🔍 Search customer name", "🔍 வாடிக்கையாளர் பெயர் தேடு"), key="cust_list_search").strip().lower()
+            if list_search:
+                table_data = [r for r in table_data if list_search in r["Customer Name"].lower()]
+            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
 
-                    if st.button(t("➕ Add Brand/Product", "➕ பொருள் சேர்க்க"), key=f"btn_add_ed_{cid}"):
-                        st.session_state[edit_key].append({"item": AVAILABLE_ITEMS[0], "qty": 1.0})
-                        st.rerun()
+            # ---------------- EDIT CUSTOMER ----------------
+            st.markdown("---")
+            st.markdown("### " + t("✏️ Edit Customer", "✏️ வாடிக்கையாளரை திருத்து"))
+            id_to_name = {c[0]: c[1] for c in customers}
+            edit_cid = st.selectbox(t("Select customer to edit", "திருத்த வேண்டிய வாடிக்கையாளர்"),
+                                    list(id_to_name), format_func=id_to_name.get, key="edit_cust_sel")
+            cust = next(c for c in customers if c[0] == edit_cid)
+            ver = st.session_state.setdefault(f"edit_ver_{edit_cid}", 0)
+            items_key = f"edit_items_{edit_cid}_{ver}"
+            if items_key not in st.session_state:
+                st.session_state[items_key] = [{"item": i, "qty": q} for i, q in items_map.get(edit_cid, [])] \
+                    or [{"item": AVAILABLE_ITEMS[0], "qty": 1.0}]
+            k = f"{edit_cid}_{ver}"  # widget keys change after each save => fields reload fresh
 
-                    if st.button(t("💾 Save Customer Changes", "💾 மாற்றங்களை சேமிக்கவும்"), key=f"btn_save_ed_{cid}", type="primary"):
-                        items_to_save = [(x["item"], x["qty"]) for x in st.session_state[edit_key]]
-                        update_customer(cid, ename.strip(), ephone.strip(), eaddress.strip(), items_to_save, eactive)
-                        if edit_key in st.session_state:
-                            del st.session_state[edit_key]
-                        for k in list(st.session_state.keys()):
-                            if k.startswith(f"ed_it_{cid}_") or k.startswith(f"ed_qty_{cid}_"):
-                                del st.session_state[k]
-                        st.toast(t("✅ Customer updated successfully!", "✅ புதுப்பிக்கப்பட்டது!"), icon="🎉")
-                        st.rerun()
+            e_name = st.text_input(t("Name", "பெயர்"), value=cust[1], key=f"e_name_{k}")
+            e_phone = st.text_input(t("Phone", "தொலைபேசி எண்"), value=cust[2] or "", key=f"e_phone_{k}")
+            e_active = st.checkbox(t("Active", "செயலில்"), value=(cust[4] == 1), key=f"e_active_{k}")
 
-                    with st.form(f"delete_form_{cid}"):
-                        st.markdown("---")
-                        st.markdown(t("🔒 **Secure Deletion:** Enter deletion password (PIN: `1234`) to delete.", "🔒 **பாதுகாப்பான நீக்கம்:** வாடிக்கையாளரை நீக்க கடவுச்சொல்லை உள்ளிடவும் (PIN: `1234`)."))
-                        del_password = st.text_input(t("Deletion Password", "கடவுச்சொல்"), type="password", key=f"del_pwd_{cid}")
-                        remove = st.form_submit_button(t("🗑️ Delete Customer", "🗑️ நீக்கவும்"))
-                        if remove:
-                            if del_password == "1234":
-                                delete_customer(cid)
-                                st.toast(t("⚠️ Customer deleted!", "⚠ வாடிக்கையாளர் நீக்கப்பட்டார்!"), icon="🗑️")
-                                st.rerun()
-                            else:
-                                st.error(t("❌ Incorrect password!", "❌ தவறான கடவுச்சொல்!"))
+            st.markdown("**" + t("Customer Products / Brands", "வாடிக்கையாளர் பொருட்கள் / பிராண்டுகள்") + "**")
+            edit_items = st.session_state[items_key]
+            remove_idx = None
+            for idx, entry in enumerate(edit_items):
+                c1, c2, c3 = st.columns([4, 2, 1])
+                cur = AVAILABLE_ITEMS.index(entry["item"]) if entry["item"] in AVAILABLE_ITEMS else 0
+                entry["item"] = c1.selectbox(f"{t('Product', 'பொருள்')} #{idx+1}", AVAILABLE_ITEMS, index=cur, key=f"e_item_{k}_{idx}")
+                entry["qty"] = c2.number_input(f"{t('Qty', 'அளவு')} #{idx+1}", min_value=1, value=max(int(round(entry["qty"])), 1), step=1, key=f"e_qty_{k}_{idx}")
+                if len(edit_items) > 1 and c3.button("❌", key=f"e_rm_{k}_{idx}"):
+                    remove_idx = idx
+            if remove_idx is not None:
+                edit_items.pop(remove_idx)
+                st.rerun()
 
-# ---------------- Daily Delivery ----------------
-elif menu == "Daily Delivery":
-    st.subheader(t("Daily Milk & Curd Delivery", "தினசரி பால் & தயிர் விநியோகம்"))
-    delivery_date = st.date_input(t("Delivery date", "விநியோக தேதி"), value=date.today())
-    formatted_delivery_date = delivery_date.strftime("%d-%b-%Y")
-    customers = get_customers(include_inactive=False)
+            if st.button(t("➕ Add Brand/Product", "➕ பிராண்ட் / பொருள் சேர்க்க"), key=f"e_add_{k}"):
+                edit_items.append({"item": AVAILABLE_ITEMS[0], "qty": 1.0})
+                st.rerun()
 
-    if not customers:
-        st.warning(t("Add customers before entering deliveries.", "விநியோகங்களை பதிவு செய்ய முதலில் வாடிக்கையாளர்களை சேர்க்கவும்."))
-    else:
-        existing_rows = get_deliveries(None, delivery_date.isoformat())
-        is_modification = len(existing_rows) > 0
-
-        if is_modification:
-            st.markdown(
-                f'<div class="warn-banner">{t(f"⚠ Delivery records for {formatted_delivery_date} already exist.", f"⚠ {formatted_delivery_date} தேதிக்கான விநியோக பதிவுகள் ஏற்கனவே உள்ளன.")}</div>', 
-                unsafe_allow_html=True
-            )
-            overwrite_confirm = st.checkbox(t("Yes, I want to modify/update today's delivery records", "ஆம், இன்றைய பதிவுகளை மாற்றியமைக்க விரும்புகிறேன்"), value=True)
-        else:
-            overwrite_confirm = True
-
-        st.markdown(f"### {t('Today\'s Customers', 'இன்றைய வாடிக்கையாளர்கள்')}")
-
-        daily_state_key = f"daily_rows_{delivery_date.isoformat()}"
-        if daily_state_key not in st.session_state:
-            st.session_state[daily_state_key] = {}
-
-        d_state = st.session_state[daily_state_key]
-
-        form_data = {}
-        for c in customers:
-            cid, name, phone, address, active, created = c
-            
-            if cid not in d_state:
-                existing = get_customer_deliveries_for_date(cid, delivery_date.isoformat())
-                if existing:
-                    d_state[cid] = [{"item": e["item_name"], "qty": float(e["quantity"]), "status": e["status"], "note": e["note"] or ""} for e in existing]
+            st.caption(t("Changes apply to every day that is NOT already saved in Daily Delivery. "
+                         "Days already saved keep their old quantities - so to start extra milk from tomorrow, just edit here today.",
+                         "சேமிக்கப்படாத நாட்களுக்கு மாற்றம் பொருந்தும். ஏற்கனவே சேமித்த நாட்கள் மாறாது."))
+            if st.button(t("💾 Save Customer Changes", "💾 மாற்றங்களை சேமி"), type="primary", key=f"e_save_{k}"):
+                names_chosen = [e["item"] for e in edit_items]
+                if not e_name.strip():
+                    st.error(t("Customer name required", "பெயர் கட்டாயம்"))
+                elif len(set(names_chosen)) != len(names_chosen):
+                    st.error(t("Same product is added twice - merge them into one row with the total quantity.",
+                               "ஒரே பொருள் இரண்டு முறை உள்ளது - ஒரே வரியாக மொத்த அளவுடன் சேர்க்கவும்."))
                 else:
-                    cust_items = get_customer_items(cid)
-                    if cust_items:
-                        d_state[cid] = [{"item": ci["item_name"], "qty": float(ci["normal_qty"]), "status": "Delivered", "note": ""} for ci in cust_items]
-                    else:
-                        d_state[cid] = [{"item": AVAILABLE_ITEMS[0], "qty": 1.0, "status": "Delivered", "note": ""}]
-
-            with st.container(border=True):
-                st.markdown(f"**{name}**")
-                rows_for_cust = d_state[cid]
-                updated_rows = []
-                
-                for idx, row_data in enumerate(rows_for_cust):
-                    col1, col2, col3, col4, col5 = st.columns([2.2, 1.1, 1.5, 2, 0.8])
-                    item_def_idx = AVAILABLE_ITEMS.index(row_data["item"]) if row_data["item"] in AVAILABLE_ITEMS else 0
-                    item_sel = col1.selectbox(t("Product", "பொருள்"), AVAILABLE_ITEMS, index=item_def_idx, key=f"d_item_{cid}_{idx}")
-                    qty_inp = col2.number_input(t("Qty", "அளவு"), min_value=0.0, max_value=100.0, value=float(row_data["qty"]), step=1.0, key=f"d_qty_{cid}_{idx}")
-                    status_sel = col3.selectbox(t("Status", "நிலை"), [t("Delivered", "Delivered"), t("No Milk", "No Milk")], index=0 if row_data["status"] in ["Delivered", "விநியோகிக்கப்பட்டது"] else 1, key=f"d_stat_{cid}_{idx}")
-                    note_inp = col4.text_input(t("Note", "குறிப்பு"), value=row_data["note"], key=f"d_note_{cid}_{idx}")
-                    
-                    actual_status = "Delivered" if status_sel in ["Delivered", t("Delivered", "Delivered")] else "No Milk"
-                    if actual_status == "No Milk":
-                        qty_inp = 0.0
-
-                    if len(rows_for_cust) > 1:
-                        if col5.button("❌", key=f"d_del_{cid}_{idx}"):
-                            continue
-                    
-                    updated_rows.append({"item": item_sel, "qty": qty_inp, "status": actual_status, "note": note_inp})
-
-                d_state[cid] = updated_rows
-
-                if st.button(t("➕ Add Product", "➕ பொருள் சேர்க்க"), key=f"btn_add_prod_{cid}"):
-                    d_state[cid].append({"item": AVAILABLE_ITEMS[0], "qty": 1.0, "status": "Delivered", "note": ""})
+                    update_customer(edit_cid, e_name.strip(), e_phone.strip(), (cust[3] or ""),
+                                    [(e["item"], e["qty"]) for e in edit_items], e_active)
+                    reset_daily_sheets()
+                    st.session_state.pop(items_key, None)
+                    st.session_state[f"edit_ver_{edit_cid}"] = ver + 1
+                    st.toast(t("Customer updated!", "வாடிக்கையாளர் புதுப்பிக்கப்பட்டது!"), icon="✅")
                     st.rerun()
 
-                form_data[cid] = d_state[cid]
+            st.markdown("---")
+            with st.expander(t("🗑️ Delete Customer", "🗑️ வாடிக்கையாளரை நீக்கவும்")):
+                cid_del = st.selectbox("Select Customer to Delete", list(id_to_name), format_func=id_to_name.get, key="del_cust_sel")
+                pin = st.text_input("PIN (1234)", type="password")
+                if st.button("Confirm Delete", type="primary"):
+                    if pin == "1234":
+                        delete_customer(cid_del)
+                        reset_daily_sheets()
+                        st.toast("Customer Deleted!", icon="🗑️")
+                        st.rerun()
+                    else:
+                        st.error("Invalid PIN")
 
-        if st.button(t("💾 Save Today's Delivery", "💾 இன்றைய விநியோகத்தை சேமிக்கவும்"), type="primary", use_container_width=True):
-            if not overwrite_confirm:
-                st.error(t("Please check the confirmation box to modify existing records.", "பதிவுகளை மாற்ற உறுதிப்படுத்தல் பெட்டியை சரிபார்க்கவும்."))
-            else:
-                for cid, items in form_data.items():
-                    clear_deliveries_for_date(cid, delivery_date.isoformat())
-                    for itm in items:
-                        stat = "No Milk" if itm["qty"] <= 0 else itm["status"]
-                        q = 0.0 if stat == "No Milk" else itm["qty"]
-                        
-                        r_info = item_rates.get(itm["item"], {"cost_price": 20.0, "sell_price": 25.0})
-                        cost_rate = r_info["cost_price"]
-                        sell_rate = r_info["sell_price"]
-                        
-                        save_delivery(cid, delivery_date.isoformat(), itm["item"], q, cost_rate, sell_rate, stat, itm["note"])
+# ---------------- Daily Delivery (Normal + Extra milk) ----------------
+elif menu == "Daily Delivery":
+    st.subheader(t("Daily Milk & Curd Delivery", "தினசரி பால் & தயிர் விநியோகம்"))
 
-                st.toast(t(f"✅ Delivery saved for {formatted_delivery_date}!", f"✅ {formatted_delivery_date} விநியோகம் சேமிக்கப்பட்டது!"), icon="🎉")
+    col_d, _ = st.columns([2, 2])
+    with col_d:
+        delivery_date = st.date_input(t("Delivery Date", "விநியோக தேதி"), value=date.today())
+    date_str = delivery_date.isoformat()
+    customers = get_customers(include_inactive=False)
+
+    # ---- Which dates are already saved? ----
+    saved_list = get_saved_dates(delivery_date.strftime("%Y-%m"))
+    saved_by_date = {r["date"]: r for r in saved_list}
+    if date_str in saved_by_date:
+        r_ = saved_by_date[date_str]
+        st.success(t(f"✅ {delivery_date:%d-%b-%Y} is SAVED – {r_['delivered']} customers got milk, {r_['no_milk']} no milk, "
+                     f"{r_['extra_qty']:g} extra packets. You can edit and save again.",
+                     f"✅ {delivery_date:%d-%b-%Y} சேமிக்கப்பட்டது – {r_['delivered']} பேருக்கு பால், {r_['no_milk']} பேருக்கு இல்லை, "
+                     f"{r_['extra_qty']:g} கூடுதல் பாக்கெட். மீண்டும் திருத்தி சேமிக்கலாம்."))
+    else:
+        st.warning(t(f"⚠️ {delivery_date:%d-%b-%Y} is NOT saved yet.", f"⚠️ {delivery_date:%d-%b-%Y} இன்னும் சேமிக்கப்படவில்லை."))
+    with st.expander(t(f"📅 Saved dates in {delivery_date:%B %Y}", f"📅 {delivery_date:%B %Y} இல் சேமித்த தேதிகள்")):
+        _today = date.today()
+        _yr, _mo = delivery_date.year, delivery_date.month
+        _last = calendar.monthrange(_yr, _mo)[1]
+        _upto = _last if (_yr, _mo) < (_today.year, _today.month) else (_today.day if (_yr, _mo) == (_today.year, _today.month) else 0)
+        _missing = [d for d in range(1, _upto + 1) if f"{_yr:04d}-{_mo:02d}-{d:02d}" not in saved_by_date]
+        if _missing:
+            st.warning(t("Not saved yet: ", "சேமிக்காத தேதிகள்: ") + ", ".join(f"{d:02d}" for d in _missing))
+        elif _upto:
+            st.success(t("All dates up to today are saved ✅", "இன்று வரை அனைத்து தேதிகளும் சேமிக்கப்பட்டுள்ளன ✅"))
+        if saved_list:
+            sdf = pd.DataFrame([{
+                "Date": datetime.strptime(r["date"], "%Y-%m-%d").strftime("%d %b (%a)"),
+                "Delivered Customers": r["delivered"], "No Milk Customers": r["no_milk"],
+                "Extra Customers": r["extra_customers"], "Extra Packets": r["extra_qty"],
+            } for r in saved_list])
+            st.dataframe(sdf, use_container_width=True, hide_index=True, column_config=num_cfg(sdf))
+        else:
+            st.caption(t("No date saved in this month yet.", "இந்த மாதத்தில் சேமித்த தேதி இல்லை."))
+
+    if not customers:
+        st.warning(t("No active customers found.", "செயலில் உள்ள வாடிக்கையாளர்கள் இல்லை."))
+    else:
+        item_rates = get_item_rates()
+        cust_lookup = {c[0]: c[1] for c in customers}
+        name_to_id = {name: cid for cid, name in cust_lookup.items()}
+        cust_names = list(cust_lookup.values())
+
+        state_key = f"daily_df_{date_str}"
+        ver_key = f"daily_ver_{date_str}"
+
+        # drop sheets of other dates so session memory doesn't grow
+        for k in [k for k in st.session_state if k.startswith("daily_df_") and k != state_key]:
+            del st.session_state[k]
+
+        # DB is only queried when the sheet for this date is first opened (not on every click)
+        if state_key not in st.session_state:
+            existing_map = get_deliveries_map_for_date(date_str)
+            default_map = get_all_customer_items()
+
+            table_data = []
+            for cid, name, *_ in customers:
+                if cid in existing_map:
+                    for r in existing_map[cid]:
+                        delivered = r["status"] in ["Delivered", "விநியோகிக்கப்பட்டது"]
+                        table_data.append({
+                            "Customer Name": name, "Product": r["item"],
+                            "Normal Qty": max(r["qty"] - r["extra"], 0.0), "Extra Qty": r["extra"],
+                            "Status": "Delivered" if delivered else "No Milk", "Note": r["note"]
+                        })
+                else:
+                    defaults = default_map.get(cid) or [(AVAILABLE_ITEMS[0], 1.0)]
+                    for item, qty in defaults:
+                        table_data.append({
+                            "Customer Name": name, "Product": item,
+                            "Normal Qty": float(qty), "Extra Qty": 0.0,
+                            "Status": "Delivered", "Note": ""
+                        })
+            st.session_state[state_key] = pd.DataFrame(table_data)
+        st.session_state.setdefault(ver_key, 0)
+
+        # ---- Quick add: customer asked for EXTRA milk ----
+        with st.expander(t("➕ Customer asked for EXTRA milk / brand", "➕ வாடிக்கையாளர் கூடுதல் பால் / பிராண்ட் கேட்டார்"), expanded=False):
+            st.caption(t("Adds to the 'Extra Qty' of that customer's row (or creates a new row). "
+                         "It refreshes the table below, so save other edits first.",
+                         "அந்த வாடிக்கையாளரின் 'Extra Qty' இல் சேர்க்கப்படும். மற்ற திருத்தங்களை முதலில் சேமிக்கவும்."))
+            col_c, col_p, col_q, col_b = st.columns([3, 3, 2, 2])
+            selected_cust_name = col_c.selectbox(t("Customer", "வாடிக்கையாளர்"), cust_names, key="add_extra_cust")
+            selected_product = col_p.selectbox(t("Product", "பொருள்"), AVAILABLE_ITEMS, key="add_extra_prod")
+            selected_qty = col_q.number_input(t("Extra Qty", "கூடுதல் அளவு"), min_value=1, value=1, step=1, key="add_extra_qty")
+
+            if col_b.button(t("➕ Add Extra", "➕ சேர்க்க"), type="primary", use_container_width=True):
+                df = st.session_state[state_key]
+                mask = (df["Customer Name"] == selected_cust_name) & (df["Product"] == selected_product)
+                if mask.any():
+                    idx = df.index[mask][0]
+                    df.loc[idx, "Extra Qty"] = float(df.loc[idx, "Extra Qty"] or 0) + float(selected_qty)
+                    df.loc[idx, "Status"] = "Delivered"
+                else:
+                    df = pd.concat([df, pd.DataFrame([{
+                        "Customer Name": selected_cust_name, "Product": selected_product,
+                        "Normal Qty": 0.0, "Extra Qty": float(selected_qty),
+                        "Status": "Delivered", "Note": ""
+                    }])], ignore_index=True)
+                st.session_state[state_key] = df
+                st.session_state[ver_key] += 1  # new editor key => editor reloads from the updated sheet
+                st.toast(f"Extra added for {selected_cust_name}!", icon="🎉")
                 st.rerun()
+
+        # ---- Remove an extra that was added by mistake ----
+        with st.expander(t("🗑️ Remove EXTRA milk (added by mistake)", "🗑️ கூடுதல் பாலை நீக்கு (தவறாக சேர்த்தால்)"), expanded=False):
+            df_x = st.session_state[state_key]
+            ex_rows = df_x[df_x["Extra Qty"].fillna(0) > 0]
+            if ex_rows.empty:
+                st.caption(t("There is no extra milk on this sheet.", "இந்த பட்டியலில் கூடுதல் பால் இல்லை."))
+            else:
+                st.caption(t("Removes the extra packets. A row that was only created for the extra is deleted too. "
+                             "You can also set Extra Qty to 0 in the table - it is cleaned up automatically on Save.",
+                             "கூடுதல் பாக்கெட்டுகளை நீக்கும். Extra Qty ஐ 0 ஆக்கினாலும் Save செய்யும்போது தானாக நீங்கும்."))
+                labels = {i: f"{r['Customer Name']} — {r['Product']} (extra {float(r['Extra Qty']):g})" for i, r in ex_rows.iterrows()}
+                pick = st.selectbox(t("Extra entry", "கூடுதல் பதிவு"), list(labels), format_func=labels.get)
+                rx1, rx2 = st.columns(2)
+                if rx1.button(t("🗑️ Remove this extra", "🗑️ இதை நீக்கு"), type="primary", use_container_width=True):
+                    df_x.loc[pick, "Extra Qty"] = 0.0
+                    st.session_state[state_key] = drop_empty_extra_rows(df_x, name_to_id, get_all_customer_items())
+                    st.session_state[ver_key] += 1
+                    st.rerun()
+                if rx2.button(t("🗑️ Remove ALL extras on this sheet", "🗑️ அனைத்து கூடுதலையும் நீக்கு"), use_container_width=True):
+                    df_x["Extra Qty"] = 0.0
+                    st.session_state[state_key] = drop_empty_extra_rows(df_x, name_to_id, get_all_customer_items())
+                    st.session_state[ver_key] += 1
+                    st.rerun()
+
+        # ---- Quick action: customer takes NO milk today (quantities become 0) ----
+        with st.expander(t("🚫 Customer NOT taking milk today (No Milk)", "🚫 இன்று பால் வேண்டாம் (No Milk)"), expanded=False):
+            st.caption(t("Sets Normal Qty and Extra Qty to 0 and Status to No Milk for all rows of that customer. "
+                         "'Restore' brings back the customer's default quantities. Save other edits first.",
+                         "அந்த வாடிக்கையாளரின் அனைத்து அளவுகளும் 0 ஆகும். 'Restore' இயல்பு அளவுகளை மீட்கும். மற்ற திருத்தங்களை முதலில் சேமிக்கவும்."))
+            nm_c, nm_b1, nm_b2 = st.columns([5, 2, 2])
+            nm_cust = nm_c.selectbox(t("Customer", "வாடிக்கையாளர்"), cust_names, key="no_milk_cust")
+            if nm_b1.button(t("🚫 No Milk", "🚫 பால் இல்லை"), type="primary", use_container_width=True):
+                df = st.session_state[state_key]
+                m_ = df["Customer Name"] == nm_cust
+                df.loc[m_, ["Normal Qty", "Extra Qty"]] = 0.0
+                df.loc[m_, "Status"] = "No Milk"
+                st.session_state[state_key] = df
+                st.session_state[ver_key] += 1
+                st.rerun()
+            if nm_b2.button(t("↩ Restore", "↩ மீட்டமை"), use_container_width=True):
+                df = st.session_state[state_key]
+                df = df[df["Customer Name"] != nm_cust]
+                defaults = get_all_customer_items().get(name_to_id[nm_cust]) or [(AVAILABLE_ITEMS[0], 1.0)]
+                restored = pd.DataFrame([{"Customer Name": nm_cust, "Product": i, "Normal Qty": float(q), "Extra Qty": 0.0,
+                                          "Status": "Delivered", "Note": ""} for i, q in defaults])
+                df = pd.concat([df, restored], ignore_index=True)
+                names_ = df["Customer Name"].tolist()
+                order_ = sorted(range(len(names_)), key=lambda i: natural_sort_key(names_[i]))
+                df = df.iloc[order_].reset_index(drop=True)
+                st.session_state[state_key] = df
+                st.session_state[ver_key] += 1
+                st.rerun()
+
+        st.info(t("💡 Normal Qty = regular supply. Extra Qty = extra packets the customer asked for today "
+                  "(billed too, and shown in the Extra Milk Report). Edit freely – nothing is sent until you press Save.",
+                  "💡 Normal Qty = வழக்கமான அளவு. Extra Qty = இன்று கூடுதலாக கேட்டது. சேமி பொத்தானை அழுத்தும் வரை எதுவும் சேமிக்கப்படாது."))
+
+        # ---- Search by customer name (filters the sheet; hidden rows are kept and saved untouched) ----
+        search_q = st.text_input(t("🔍 Search customer name", "🔍 வாடிக்கையாளர் பெயர் தேடு"), key="daily_search",
+                                 placeholder=t("type part of a name…", "பெயரின் ஒரு பகுதியை தட்டச்சு செய்க…")).strip().lower()
+        full_df = st.session_state[state_key]
+        if search_q:
+            view_df = full_df[full_df["Customer Name"].astype(str).str.lower().str.contains(search_q, regex=False)]
+            st.caption(t(f"Showing {len(view_df)} of {len(full_df)} rows. Press Save before changing the search, "
+                         "otherwise unsaved edits are lost.",
+                         f"{len(full_df)} இல் {len(view_df)} வரிகள். தேடலை மாற்றும் முன் சேமிக்கவும்."))
+        else:
+            view_df = full_df
+
+        # The editor lives in a FORM: typing in cells no longer re-runs the whole app each time.
+        with st.form(f"daily_form_{date_str}"):
+            edited_df = st.data_editor(
+                style_brand(view_df, ["Product"]),
+                column_config={
+                    "Customer Name": st.column_config.SelectboxColumn(options=cust_names, required=True),
+                    "Product": st.column_config.SelectboxColumn(options=AVAILABLE_ITEMS, required=True),
+                    "Normal Qty": st.column_config.NumberColumn(min_value=0, max_value=100, step=1, format="%d"),
+                    "Extra Qty": st.column_config.NumberColumn(min_value=0, max_value=100, step=1, format="%d"),
+                    "Status": st.column_config.SelectboxColumn(options=["Delivered", "No Milk"], required=True),
+                    "Note": st.column_config.TextColumn()
+                },
+                use_container_width=True,
+                num_rows="dynamic",
+                hide_index=True,
+                key=f"daily_editor_{date_str}_{st.session_state[ver_key]}_{search_q}"
+            )
+            save_clicked = st.form_submit_button(t("💾 Save Today's Delivery", "💾 இன்றைய விநியோகத்தை சேமிக்கவும்"),
+                                                 type="primary", use_container_width=True)
+
+        if save_clicked:
+            # Merge duplicate (customer, product) rows by summing – the DB allows one row per pair,
+            # the old code silently let the last duplicate overwrite the earlier ones.
+            merged = {}
+            # rows hidden by the search filter + the (possibly edited) visible rows
+            hidden_df = full_df.drop(index=view_df.index)
+            all_rows_df = pd.concat([hidden_df, pd.DataFrame(edited_df)], ignore_index=True)
+            # Extra Qty = 0 (and nothing else on that row) -> the row is removed automatically
+            all_rows_df = drop_empty_extra_rows(all_rows_df, name_to_id, get_all_customer_items())
+            for _, row in all_rows_df.iterrows():
+                c_name, item = row["Customer Name"], row["Product"]
+                if c_name not in name_to_id or item not in AVAILABLE_ITEMS:
+                    continue
+                normal = float(round(row["Normal Qty"])) if pd.notnull(row["Normal Qty"]) else 0.0
+                extra = float(round(row["Extra Qty"])) if pd.notnull(row["Extra Qty"]) else 0.0
+                status = row["Status"] if pd.notnull(row["Status"]) else "Delivered"
+                note = str(row["Note"]).strip() if pd.notnull(row["Note"]) else ""
+                if status == "No Milk":
+                    normal = extra = 0.0
+
+                m = merged.setdefault((name_to_id[c_name], item), {"normal": 0.0, "extra": 0.0, "notes": []})
+                m["normal"] += normal
+                m["extra"] += extra
+                if note and note not in m["notes"]:
+                    m["notes"].append(note)
+
+            rows_to_save = []
+            for (cid, item), m in merged.items():
+                total = m["normal"] + m["extra"]
+                r_info = item_rates.get(item, DEFAULT_RATE)
+                rows_to_save.append({
+                    "cid": cid, "item": item, "qty": total, "extra": m["extra"],
+                    "cp": r_info["cost_price"], "sp": r_info["sell_price"],
+                    "status": "Delivered" if total > 0 else "No Milk",
+                    "note": "; ".join(m["notes"])
+                })
+
+            save_daily_deliveries(date_str, list(name_to_id.values()), rows_to_save)  # 1 transaction
+
+            st.session_state.pop(state_key, None)
+            st.session_state[ver_key] += 1  # fresh editor key so old cell edits are not re-applied
+            st.toast(t("Delivery saved successfully!", "விநியோகம் சேமிக்கப்பட்டது!"), icon="🎉")
+            st.rerun()
+
+        # ---- Report of what is SAVED for this date: extra milk + customers who did not get milk ----
+        if date_str in saved_by_date:
+            st.markdown("---")
+            st.markdown("### " + t(f"📋 Saved report – {delivery_date:%d-%b-%Y}", f"📋 சேமித்த அறிக்கை – {delivery_date:%d-%b-%Y}"))
+            saved_extra = get_extra_report(date_str, date_str)
+            saved_no_milk = get_no_milk_customers(date_str)
+            r_ = saved_by_date[date_str]
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric(t("Delivered customers", "பால் பெற்றவர்கள்"), r_["delivered"])
+            q2.metric(t("Not delivered", "பால் வழங்காதவர்கள்"), len(saved_no_milk))
+            q3.metric(t("➕ Extra packets", "➕ கூடுதல் பாக்கெட்"), f"{r_['extra_qty']:g}")
+            q4.metric(t("➕ Extra amount (₹)", "➕ கூடுதல் தொகை (₹)"), f"₹{_m(sum(x['Amount (₹)'] for x in saved_extra))}")
+            col_e, col_n = st.columns(2)
+            with col_e:
+                st.markdown("**" + t("➕ Extra milk added", "➕ கூடுதல் பால் சேர்க்கப்பட்டது") + "**")
+                if saved_extra:
+                    edf = pd.DataFrame(saved_extra).drop(columns=["Date"])
+                    st.dataframe(style_brand(edf, ["Product"]), use_container_width=True, hide_index=True, column_config=num_cfg(edf))
+                else:
+                    st.info(t("No extra milk on this date.", "இந்த தேதியில் கூடுதல் பால் இல்லை."))
+            with col_n:
+                st.markdown("**" + t("🚫 Customers NOT delivered", "🚫 பால் வழங்காத வாடிக்கையாளர்கள்") + "**")
+                if saved_no_milk:
+                    st.dataframe(pd.DataFrame(saved_no_milk), use_container_width=True, hide_index=True)
+                else:
+                    st.success(t("Everyone got their milk ✅", "அனைவருக்கும் பால் வழங்கப்பட்டது ✅"))
+            st.caption(t("This report shows what is saved in the database for this date.", "இது சேமிக்கப்பட்ட தரவின் அறிக்கை."))
+
 
 # ---------------- Billing & Receipts ----------------
 elif menu == "Billing & Receipts":
-    st.subheader(t("Monthly Billing & Receipt Generator", "மாதாந்திர பில் & ரசீது உருவாக்கம்"))
+    st.subheader(t("Monthly Billing & Receipt Generator", "மாதாந்திர பில் & ரசீது"))
     customers = get_customers(include_inactive=True)
-    if not customers:
-        st.info(t("No customers available.", "வாடிக்கையாளர்கள் இல்லை."))
-    else:
-        selected_month = st.date_input(t("Select month", "மாதத்தை தேர்ந்தெடுக்கவும்"), value=date.today())
+    if customers:
+        selected_month = st.date_input(t("Select month", "மாதம்"), value=date.today())
         month_key = selected_month.strftime("%Y-%m")
+        month_label = selected_month.strftime("%B %Y")
 
-        tab_indiv, tab_bulk, tab_print = st.tabs([
-            t("👤 Individual Customer Receipt", "👤 தனிநபர் ரசீது"), 
-            t("📋 Bulk WhatsApp Queue", "📋 மொத்த வாட்ஸ்அப் வரிசை"), 
-            t("🖨 Printable A4 Bill Slips", "🖨️ பிரிண்ட் A4 பில் ஸ்லிப்புகள்")
-        ])
+        rcpt_lang = st.radio(t("Receipt / WhatsApp language", "ரசீது / வாட்ஸ்அப் மொழி"), ["ta", "en"],
+                             format_func={"ta": "தமிழ்", "en": "English"}.get, horizontal=True, key="rcpt_lang")
+        receipt_message_panel(month_key)
+        if rcpt_lang == "ta":
+            month_label = ta_month_label(selected_month.year, selected_month.month)
 
-        with tab_indiv:
-            options = {f"{c[1]} ({c[2] or 'No phone'})": c[0] for c in customers}
+        # 2 cached queries serve all three views (items for every customer + paid amounts)
+        month_items = get_all_month_items(month_key)
+        paid_map = {r[0]: float(r[7]) for r in get_all_monthly_billing(month_key)}
+        daily_map = get_all_month_daily(month_key)  # day-by-day deliveries, one query for everyone
+        include_daily = st.checkbox(t("📅 Include day-by-day delivery details in receipt & WhatsApp",
+                                      "📅 தினசரி விநியோக விவரங்களை ரசீது & வாட்ஸ்அப்பில் சேர்க்க"), value=True)
+
+        def daily_of(cid):
+            return daily_map.get(cid, []) if include_daily else None
+
+        def bill_of(cid):
+            items = month_items.get(cid, [])
+            return items, sum(i["amount"] for i in items), paid_map.get(cid, 0.0)
+
+        # radio (not tabs) => only the selected view is built
+        bviews = {
+            "single": t("👤 Individual Customer Receipt", "👤 தனிநபர் ரசீது"),
+            "queue": t("📋 Bulk WhatsApp Queue", "📋 மொத்த வாட்ஸ்அப்"),
+            "slips": t("🖨️ Printable A4 Bill Slips", "🖨️ A4 பில் ஸ்லிப்கள்"),
+        }
+        bview = st.radio("View", list(bviews), format_func=bviews.get, horizontal=True,
+                         key="bill_view", label_visibility="collapsed")
+
+        if bview == "single":
+            options = {f"{c[1]}" + ("" if c[2] else " (No phone)"): c[0] for c in customers}
             selected = st.selectbox(t("Select Customer", "வாடிக்கையாளரை தேர்ந்தெடுக்கவும்"), list(options.keys()))
             cid = options[selected]
-            
-            customer_info = get_customer(cid)
-            summary = get_monthly_summary(cid, month_key)
-            payments = get_payments(cid, month_key)
-            paid = sum(float(p[3]) for p in payments)
-            total = summary["total"]
-            balance = total - paid
+            info = get_customer(cid)
+            items, total, paid = bill_of(cid)
 
-            delivery_rows = get_deliveries(cid, month_key)
-            item_breakdown = {}
-            for r in delivery_rows:
-                item_name = r[3]
-                qty = r[4]
-                rate = r[5]
-                status = r[6]
-                if status in ["Delivered", "விநியோகிக்கப்பட்டது"] and qty > 0:
-                    if item_name not in item_breakdown:
-                        item_breakdown[item_name] = {"total_qty": 0.0, "days": 0, "rate": rate}
-                    item_breakdown[item_name]["total_qty"] += qty
-                    item_breakdown[item_name]["days"] += 1
+            m1, m2, m3 = st.columns(3)
+            m1.metric(t("Total Bill", "மொத்த பில்"), f"₹{_m(total)}")
+            m2.metric(t("Paid", "செலுத்தியது"), f"₹{_m(paid)}")
+            m3.metric(t("Balance", "நிலுவை"), f"₹{_m(total - paid)}")
 
-            phone = customer_info[2]
-            if phone:
-                clean_phone = "".join(filter(str.isdigit, str(phone)))
-                if len(clean_phone) == 10:
-                    clean_phone = "91" + clean_phone
-                elif len(clean_phone) == 11 and clean_phone.startswith("0"):
-                    clean_phone = "91" + clean_phone[1:]
-
-                st.markdown(f"### 💬 {t('WhatsApp Text Message', 'வாட்ஸ்அப் குறுஞ்செய்தி')}")
-                
-                if st.session_state.app_lang == "தமிழ்":
-                    wa_text = (
-                        f"வணக்கம் {customer_info[1]},\n\n"
-                        f"🥛 *ஆவின் / நஞ்சில் பால் & தயிர்*\n"
-                        f"மாத பில் / ரசீது (Month: {selected_month.strftime('%B %Y')})\n\n"
-                        f"வாடிக்கையாளர் பெயர்: {customer_info[1]}\n"
-                        f"தொலைபேசி: {customer_info[2] or 'N/A'} | முகவரி: {customer_info[3] or 'N/A'}\n"
-                        f"--------------------------------\n"
-                    )
-                    for itm_name, data in item_breakdown.items():
-                        wa_text += f"• {itm_name}: {data['days']} நாட்கள் ({data['total_qty']:g} பா. × ₹{data['rate']:.2f}) = ₹{data['total_qty']*data['rate']:,.2f}\n"
-                    wa_text += (
-                        f"--------------------------------\n"
-                        f"*மொத்த பில் தொகை (Total Bill Amount): ₹{total:,.2f}*\n"
-                        f"--------------------------------\n"
-                        f"💡 *பணம் செலுத்த (Payment Notice):*\n"
-                        f"தயவுசெய்து GPay / UPI மூலம் பணம் செலுத்தவும், ரொக்கப் பரிவர்த்தனையைத் தவிர்க்கவும்: 9489002466 (பேச்சிமுத்து). செலுத்திய ரசீதை எங்களுக்கு அனுப்பவும்.\n\n"
-                        f"• நஞ்சில் (Red) பால் கிடைக்கும்.\n"
-                        f"• ஆவின் தயிர் கிடைக்கும்.\n"
-                        f"• திருமண விழாக்கள் மற்றும் விசேஷங்களுக்கு பால் வீடு தேடி விநியோகம் செய்யப்படும் (24 மணி நேரத்திற்கு முன் முன்பதிவு தேவை).\n"
-                        f"தொடர்புக்கு: 8838594492 / 9489002466\n\n"
-                        f"_இது கணினி மூலம் உருவாக்கப்பட்ட பில். ஏதேனும் குறைகள் இருந்தால் 9489002466 என்ற எண்ணைத் தொடர்பு கொள்ளவும்._"
-                    )
-                else:
-                    wa_text = (
-                        f"Hello {customer_info[1]},\n\n"
-                        f"🥛 *Aavin / Nanjil Milk & Curd*\n"
-                        f"Monthly Bill / Receipt (Month: {selected_month.strftime('%B %Y')})\n\n"
-                        f"Customer Name: {customer_info[1]}\n"
-                        f"Phone: {customer_info[2] or 'N/A'} | Address: {customer_info[3] or 'N/A'}\n"
-                        f"--------------------------------\n"
-                    )
-                    for itm_name, data in item_breakdown.items():
-                        wa_text += f"• {itm_name}: {data['days']} days ({data['total_qty']:g} pkts × ₹{data['rate']:.2f}) = ₹{data['total_qty']*data['rate']:,.2f}\n"
-                    wa_text += (
-                        f"--------------------------------\n"
-                        f"*Total Bill Amount: ₹{total:,.2f}*\n"
-                        f"--------------------------------\n"
-                        f"💡 *Payment Notice:*\n"
-                        f"Please pay using GPay / UPI, avoid cash transactions: 9489002466 (Pechimuthu). Kindly share your payment receipt with us.\n\n"
-                        f"• Nanjil Red Milk available.\n"
-                        f"• Aavin Curd available.\n"
-                        f"• Milk door delivery available for marriages & special functions (24-hour advance booking required).\n"
-                        f"Contact: 8838594492 / 9489002466\n\n"
-                        f"_This is a computer-generated bill. For queries contact 9489002466._"
-                    )
-
-                st.text_area(t("Preview WhatsApp Message", "வாட்ஸ்அப் முன்னோட்டம்"), value=wa_text, height=290, key="preview_wa")
-                encoded_wa = urllib.parse.quote(wa_text, safe='')
-                wa_url = f"https://api.whatsapp.com/send?phone={clean_phone}&text={encoded_wa}"
-                st.link_button(t("💬 Send Bill via WhatsApp", "💬 வாட்ஸ்அப் மூலம் பில் அனுப்பவும்"), wa_url, use_container_width=True)
+            link = whatsapp_link(info[2], whatsapp_message(info[1], month_label, items, total, paid, daily_of(cid), lang=rcpt_lang))
+            if link:
+                st.link_button(t("💬 Send as Text via WhatsApp", "💬 வாட்ஸ்அப்பில் எழுத்தாக அனுப்பு"), link, type="primary")
+                st.caption(t("Opens WhatsApp with the full item-wise bill typed in - you only press Send.",
+                             "வாட்ஸ்அப் திறக்கும்; முழு பில் தயாராக இருக்கும் - Send அழுத்தவும்."))
             else:
-                st.warning(t("⚠️ No phone number saved for this customer.", "⚠️ இந்த வாடிக்கையாளருக்கு தொலைபேசி எண் இல்லை."))
+                st.warning(t("No valid phone number saved for this customer (add it in Customers → Edit Customer).",
+                             "இந்த வாடிக்கையாளருக்கு தொலைபேசி எண் இல்லை (Customers → Edit)."))
 
-            st.markdown("---")
-            st.markdown(f"### 📸 {t('High-Quality HTML Receipt Preview', 'உயர்தர HTML ரசீது முன்னோட்டம்')}")
-            
-            item_rows_html = ""
-            for itm_name, data in item_breakdown.items():
-                subtotal = data["total_qty"] * data["rate"]
-                item_rows_html += f"""
-                <tr style="font-weight: bold;">
-                    <td style="padding: 10px 5px; border-bottom: 1px solid #eaeaea; color: #111;">{itm_name}</td>
-                    <td style="padding: 10px 5px; border-bottom: 1px solid #eaeaea; text-align: center; color: #111;">{data['days']} {t('days', 'நாட்கள்')} ({data['total_qty']:g} {t('pkts', 'பா.')})</td>
-                    <td style="padding: 10px 5px; border-bottom: 1px solid #eaeaea; text-align: right; color: #111;">₹{data['rate']:.2f}</td>
-                    <td style="padding: 10px 5px; border-bottom: 1px solid #eaeaea; text-align: right; color: #111;">₹{subtotal:,.2f}</td>
-                </tr>
-                """
+            st.markdown("#### " + t("📷 Receipt Preview", "📷 ரசீது முன்னோட்டம்"))
+            st.caption(t("To send the receipt exactly as shown: press 📤 Share → choose WhatsApp → pick the customer (works on a phone). "
+                         "On a computer press 📥 Download image, then attach the picture in WhatsApp.",
+                         "ரசீதை அப்படியே அனுப்ப: 📤 Share → WhatsApp → வாடிக்கையாளரை தேர்வு செய்யவும் (மொபைலில்). கணினியில் 📥 Download image அழுத்தி படத்தை WhatsApp இல் இணைக்கவும்."))
+            components.html(receipt_html(info[1], info[2], info[3], month_label, items, total, paid, daily_of(cid), actions=True, filename=f"bill_{info[1]}_{month_key}", lang=rcpt_lang), height=780, scrolling=True)
 
-            p_title = t("🥛 Aavin / Nanjil Milk & Curd", "🥛 ஆவின் / நஞ்சில் பால் & தயிர்")
-            p_sub = t(f"Monthly Bill / Receipt (Month: <b>{selected_month.strftime('%B %Y')}</b>)", f"மாத பில் / ரசீது (Month: <b>{selected_month.strftime('%B %Y')}</b>)")
-            p_cname = t("Customer Name", "வாடிக்கையாளர் பெயர்")
-            p_phone = t("Phone", "தொலைபேசி")
-            p_addr = t("Address", "முகவரி")
-            p_prod = t("Product / Brand", "பொருள் / பிராண்ட்")
-            p_qty = t("Days & Quantity", "நாட்கள் & அளவு")
-            p_price = t("Rate", "விலை")
-            p_tot = t("Total", "மொத்தம்")
-            p_tot_bill = t("Total Bill Amount", "மொத்த பில் தொகை")
-            p_pay_notice = t("💡 Payment Notice:", "💡 பணம் செலுத்த (Payment Notice):")
-            p_pay_desc = t("Please pay using GPay / UPI and avoid cash transactions: <b>9489002466</b> (Pechimuthu). Please share payment receipt with us.", 
-                           "தயவுசெய்து GPay / UPI மூலம் பணம் செலுத்தவும், ரொக்கப் பரிவர்த்தனையைத் தவிர்க்கவும்: <b>9489002466</b> (பேச்சிமுத்து). பணம் செலுத்திய பின் ரசீதை எங்களுக்கு அனுப்பவும்.")
-            p_note1 = t("Nanjil Red Milk available.", "நஞ்சில் (Red) பால் கிடைக்கும்.")
-            p_note2 = t("Aavin Curd available.", "ஆவின் தயிர் கிடைக்கும்.")
-            p_note3 = t("Milk door delivery available for marriages & special functions (24-hour booking required).", "திருமண விழாக்கள் மற்றும் விசேஷங்களுக்கு பால் வீடு தேடி விநியோகம் செய்யப்படும் (24 மணி நேரத்திற்கு முன் முன்பதிவு தேவை).")
-            p_contact = t("Contact:", "தொடர்புக்கு:")
-            p_foot = t("This is a computer-generated bill. For any queries, please contact 9489002466.", "இது கணினி மூலம் உருவாக்கப்பட்ட பில். ஏதேனும் குறைகள் இருந்தால் 9489002466 என்ற எண்ணைத் தொடர்பு கொள்ளவும்.")
+        elif bview == "queue":
+            c_a, c_b = st.columns(2)
+            only_due = c_a.checkbox(t("Only customers with balance due", "நிலுவை உள்ளவர்கள் மட்டும்"), value=True)
+            only_phone = c_b.checkbox(t("Only customers with a phone number", "தொலைபேசி உள்ளவர்கள் மட்டும்"), value=False)
 
-            receipt_html = f"""
-            <div style="border: 2px solid #333; border-radius: 10px; padding: 25px 30px; background-color: #ffffff; font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; box-shadow: 0 2px 8px rgba(0,0,0,0.08); font-weight: bold; color: #000;">
-                <h2 style="text-align: center; margin-bottom: 2px; color: #1b5e20; font-weight: 800; font-size: 24px;">{p_title}</h2>
-                <p style="text-align: center; color: #333; margin-top: 0; font-size: 14px; font-weight: bold;">{p_sub}</p>
+            queue = []
+            for c in customers:
+                cid, cname, cphone = c[0], c[1], c[2]
+                items, total, paid = bill_of(cid)
+                if total <= 0 or (only_due and total - paid <= 0):
+                    continue
+                link = whatsapp_link(cphone, whatsapp_message(cname, month_label, items, total, paid, daily_of(cid), lang=rcpt_lang))
+                if only_phone and not link:
+                    continue
+                queue.append({"Customer": cname, "Phone": cphone or "—", "Bill (₹)": total, "Paid (₹)": paid,
+                              "Balance (₹)": total - paid, "WhatsApp": link})
+            if queue:
+                st.caption(t(f"{len(queue)} customers. Click 📲 Send on a row - WhatsApp opens with the bill ready.",
+                             f"{len(queue)} வாடிக்கையாளர்கள். 📲 Send அழுத்தவும்."))
+                st.dataframe(pd.DataFrame(queue), use_container_width=True, hide_index=True, height=520,
+                             column_config={**num_cfg(pd.DataFrame(queue)), "WhatsApp": st.column_config.LinkColumn("WhatsApp", display_text="📲 Send")})
+            else:
+                st.info(t("Nothing to send for this month.", "இந்த மாதம் அனுப்ப எதுவும் இல்லை."))
 
-                <hr style="border: 0; border-top: 2px solid #000; margin: 15px 0;">
-
-                <p style="font-size: 15px; color: #000; margin: 8px 0; font-weight: bold;"><b>{p_cname}:</b> {customer_info[1]}</p>
-                <p style="font-size: 15px; color: #000; margin: 8px 0; font-weight: bold;"><b>{p_phone}:</b> {customer_info[2] or 'N/A'} | <b>{p_addr}:</b> {customer_info[3] or 'N/A'}</p>
-
-                <hr style="border: 0; border-top: 2px solid #888; margin: 15px 0;">
-
-                <table style="width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 14px; font-weight: bold;">
-                    <thead>
-                        <tr style="font-weight: 800; color: #000;">
-                            <th style="text-align: left; border-bottom: 2px solid #000; padding: 8px 5px;">{p_prod}</th>
-                            <th style="text-align: center; border-bottom: 2px solid #000; padding: 8px 5px;">{p_qty}</th>
-                            <th style="text-align: right; border-bottom: 2px solid #000; padding: 8px 5px;">{p_price}</th>
-                            <th style="text-align: right; border-bottom: 2px solid #000; padding: 8px 5px;">{p_tot}</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {item_rows_html if item_rows_html else f'<tr><td colspan="4" style="text-align:center; padding: 15px; color: #000; font-weight: bold;">{t("No delivery records for this month", "இந்த மாதத்தில் விநியோக பதிவுகள் இல்லை")}</td></tr>'}
-                    </tbody>
-                </table>
-
-                <hr style="border: 0; border-top: 2px solid #000; margin: 15px 0;">
-
-                <div style="display: flex; justify-content: space-between; align-items: center; font-size: 16px; padding: 5px 0; font-weight: 800; color: #000;">
-                    <div>{p_tot_bill}:</div>
-                    <div style="color: #1b5e20; font-size: 18px;">₹{total:,.2f}</div>
-                </div>
-
-                <hr style="border: 0; border-top: 2px solid #000; margin: 15px 0 20px 0;">
-
-                <div style="background-color: #e8f5e9; padding: 12px 15px; border-radius: 6px; margin-bottom: 15px; font-size: 13px; color: #1b5e20; line-height: 1.5; font-weight: bold; border: 1px solid #a5d6a7;">
-                    <span style="font-weight: 800;">{p_pay_notice}</span><br>
-                    {p_pay_desc}
-                </div>
-
-                <ul style="font-size: 12px; color: #000; line-height: 1.6; margin: 0; padding-left: 20px; font-weight: bold;">
-                    <li>{p_note1}</li>
-                    <li>{p_note2}</li>
-                    <li>{p_note3}</li>
-                </ul>
-                <p style="font-size: 12px; color: #000; margin-top: 8px; margin-bottom: 0; font-weight: bold;"><b>{p_contact}</b> 8838594492 / 9489002466</p>
-
-                <hr style="border: 0; border-top: 1px solid #aaa; margin: 15px 0;">
-                <p style="text-align: center; font-size: 11px; color: #333; font-style: italic; margin: 0; font-weight: bold;">{p_foot}</p>
-            </div>
-            """
-            components.html(receipt_html, height=580, scrolling=True)
-
-        with tab_bulk:
-            st.markdown(f"### 📥 {t('Bulk Download', 'மொத்த பதிவிறக்கம்')}")
-            all_csv_data = export_all_customers_monthly_report_csv(month_key)
             st.download_button(
-                label=t("⬇️ Download All Customers Monthly Report (CSV)", "⬇ அனைத்து வாடிக்கையாளர்கள் மாதாந்திர அறிக்கை (CSV)"),
-                data=all_csv_data,
-                file_name=f"all_customers_milk_report_{month_key}.csv",
-                mime="text/csv",
-                type="primary"
+                label=t("⬇️ Download All Reports (CSV)", "⬇️ அனைத்து அறிக்கைகளையும் பதிவிறக்குக"),
+                data=export_all_customers_monthly_report_csv(month_key),
+                file_name=f"monthly_report_{month_key}.csv", mime="text/csv"
             )
 
-        with tab_print:
-            st.markdown(f"### 🖨️ {t('Printable A4 Bill Slips', 'பிரிண்ட் A4 பில் ஸ்லிப்புகள்')}")
-            st.info(t("💡 Press **`Ctrl + P`** in your browser to print. Set margins to **None**.", "💡 அச்சிட உங்கள் உலாவி பக்கத்தில் **`Ctrl + P`** அழுத்தவும்."))
-            
-            st.markdown("---")
-            customer_batches = [customers[i:i + 10] for i in range(0, len(customers), 10)]
+        else:
+            st.markdown("### 🖨️ " + t("Printable A4 Bill Slips", "அச்சிடக்கூடிய A4 பில் ஸ்லிப்கள்"))
+            c_a, c_b = st.columns([1, 2])
+            only_bill = c_a.checkbox(t("Only customers with a bill", "பில் உள்ளவர்கள் மட்டும்"), value=True)
+            id_to_name = {c[0]: c[1] for c in customers}
+            picked = c_b.multiselect(t("Limit to these customers (empty = all)", "குறிப்பிட்ட வாடிக்கையாளர்கள் (காலி = அனைவரும்)"),
+                                     list(id_to_name), format_func=id_to_name.get)
+            entries = []
+            for c in customers:
+                if picked and c[0] not in picked:
+                    continue
+                items, total, paid = bill_of(c[0])
+                if only_bill and total <= 0:
+                    continue
+                entries.append((c[1], items, total, paid))
 
-            for batch_idx, batch in enumerate(customer_batches):
-                st.markdown('<div class="printable-page">', unsafe_allow_html=True)
-                rows_data = [batch[i:i + 2] for i in range(0, len(batch), 2)]
-                
-                for row in rows_data:
-                    cols = st.columns(2)
-                    for col_idx, c in enumerate(row):
-                        cid, name, phone, address, active, _ = c
-                        summary = get_monthly_summary(cid, month_key)
-                        total = summary["total"]
-
-                        delivery_rows = get_deliveries(cid, month_key)
-                        cust_item_breakdown = {}
-                        for r in delivery_rows:
-                            item_name = r[3]
-                            qty = r[4]
-                            rate = r[5]
-                            status = r[6]
-                            if status in ["Delivered", "விநியோகிக்கப்பட்டது"] and qty > 0:
-                                if item_name not in cust_item_breakdown:
-                                    cust_item_breakdown[item_name] = {"total_qty": 0.0, "days": 0, "rate": rate}
-                                cust_item_breakdown[item_name]["total_qty"] += qty
-                                cust_item_breakdown[item_name]["days"] += 1
-
-                        slip_items_html = ""
-                        for itm_name, data in cust_item_breakdown.items():
-                            subtotal = data["total_qty"] * data["rate"]
-                            slip_items_html += f"<div style='font-weight: bold; color: #000;'>• {itm_name}: <b>{data['days']} {t('day', 'நாள்')}</b> ({data['total_qty']:g} {t('pkts', 'பா.')} × ₹{data['rate']:.2f} = <b>₹{subtotal:,.2f}</b>)</div>"
-
-                        with cols[col_idx]:
-                            slip_html = f"""
-                            <div style="border: 2px solid #000; padding: 5px 8px; background: #fff; font-size: 10px; color: #000; font-weight: bold; box-sizing: border-box; margin-bottom: 5px; border-radius: 4px; height: 46mm; display: flex; flex-direction: column; justify-content: space-between;">
-                                <div>
-                                    <div style="font-weight: 800; text-align: center; font-size: 11px; margin-bottom: 2px; border-bottom: 1.5px solid #000; padding-bottom: 2px; color: #1b5e20;">🥛 {t('Aavin / Nanjil Milk & Curd', 'ஆவின் / நஞ்சில் பால் & தயிர்')} ({selected_month.strftime('%b %Y')})</div>
-                                    <div style="margin-bottom: 2px; font-weight: 800; font-size: 10.5px; color: #000;">{t('Name:', 'பெயர்:')} <span style="font-weight: 800; color: #000;">{name}</span></div>
-                                    <div style="border-top: 1px solid #ddd; padding-top: 2px; min-height: 20px; font-weight: bold; color: #000;">
-                                        {slip_items_html if slip_items_html else f'<div style="font-weight: bold;">{t("No deliveries", "விநியோக பதிவுகள் இல்லை")}</div>'}
-                                    </div>
-                                </div>
-                                <div>
-                                    <div style="border-top: 1.5px solid #000; margin-top: 2px; padding-top: 2px; font-weight: 800; font-size: 11px; display: flex; justify-content: space-between; color: #000;">
-                                        <span>{t('Total Bill:', 'மொத்த பில்:')}</span> <span style="color: #1b5e20; font-weight: 800;">₹{total:,.2f}</span>
-                                    </div>
-                                    <div style="font-size: 7px; background: #e8f5e9; padding: 2px; border-radius: 2px; margin-top: 1px; text-align: center; line-height: 1.2; font-weight: 800; color: #1b5e20; border: 1px solid #a5d6a7;">
-                                        GPay / UPI: <b>9489002466</b> ({t('Pechimuthu', 'பேச்சிமுத்து')})<br>
-                                        {t('Please pay using GPay/UPI, avoid cash & share receipt.', 'தயவுசெய்து GPay/UPI மூலம் செலுத்தவும். ரொக்கத்தைத் தவிர்த்து, ரசீதைப் பகிரவும்.')}
-                                    </div>
-                                    <div style="font-size: 6.5px; color: #000; text-align: center; margin-top: 1px; border-top: 1px dotted #000; padding-top: 1px; font-weight: bold;">
-                                        {t('Computer generated bill. Contact:', 'இது கணினி பில். குறைகளுக்கு:')} <b>9489002466</b>
-                                    </div>
-                                </div>
-                            </div>
-                            """
-                            st.markdown(slip_html, unsafe_allow_html=True)
-
-                st.markdown('</div>', unsafe_allow_html=True)
+            if entries:
+                doc = slips_document(entries, month_label, lang=rcpt_lang)
+                st.info(t("💡 Click **Print A4** in the preview (or Ctrl+P), set Margins to **None**. "
+                          f"{SLIPS_PER_PAGE} slips per page.",
+                          f"💡 'Print A4' அழுத்தவும் (அல்லது Ctrl+P), Margins = None. ஒரு பக்கத்தில் {SLIPS_PER_PAGE} ஸ்லிப்கள்."))
+                st.download_button(t("⬇️ Download slips (open file → Print)", "⬇️ ஸ்லிப்களை பதிவிறக்கு"),
+                                   data=doc.encode("utf-8"), file_name=f"bill_slips_{month_key}.html", mime="text/html")
+                components.html(doc, height=900, scrolling=True)
+            else:
+                st.info(t("No bills to print for this month.", "இந்த மாதம் அச்சிட பில்கள் இல்லை."))
 
 # ---------------- Payments ----------------
 elif menu == "Payments":
     st.subheader(t("Payments", "செலுத்திய தொகைகள்"))
     customers = get_customers(include_inactive=True)
-    if not customers:
-        st.info(t("No customers available.", "வாடிக்கையாளர்கள் இல்லை."))
-    else:
-        selected_month = st.date_input(t("Billing month", "பில் மாதம்"), value=date.today())
-        month_key = selected_month.strftime("%Y-%m")
-        options = {f"{c[1]}": c[0] for c in customers}
-        selected = st.selectbox(t("Customer", "வாடிக்கையாளரை தேர்ந்தெடுக்கவும்"), list(options.keys()))
-        cid = options[selected]
-        summary = get_monthly_summary(cid, month_key)
-        payments = get_payments(cid, month_key)
-        paid = sum(float(p[3]) for p in payments)
-        balance = summary["total"] - paid
+    if customers:
+        pviews = {"manual": t("✍️ Record a payment", "✍️ தொகையை பதிவு செய்"),
+                  "upload": t("📤 Upload bank / PhonePe / GPay statement (CSV)", "📤 வங்கி / PhonePe / GPay ஸ்டேட்மெண்ட் (CSV)")}
+        pview = st.radio("View", list(pviews), format_func=pviews.get, horizontal=True, key="pay_view", label_visibility="collapsed")
 
-        st.metric(t("Outstanding Balance", "நிலுவைத் தொகை"), f"₹{balance:,.2f}")
-        with st.form("payment_form"):
-            amount = st.number_input(t("Payment amount (₹)", "செலுத்தும் தொகை (₹)"), min_value=0.0, value=max(balance, 0.0), step=10.0)
-            payment_date = st.date_input(t("Payment date", "செலுத்திய தேதி"), value=date.today())
-            method = st.selectbox(t("Payment method", "பணம் செலுத்திய முறை"), ["Cash", "UPI", "Bank Transfer", "Other"])
-            note = st.text_input(t("Note", "குறிப்பு"))
-            submit = st.form_submit_button(t("Record Payment", "பதிவு செய்"))
-            if submit:
-                if amount <= 0:
-                    st.error(t("Enter a payment amount greater than zero.", "பூஜ்யத்தை விட அதிகமான தொகையை உள்ளிடவும்."))
-                else:
-                    add_payment(cid, month_key, payment_date.isoformat(), amount, method, note)
-                    st.toast(t("✅ Payment recorded successfully!", "✅ தொகை பதிவு செய்யப்பட்டது!"), icon="💵")
-                    st.rerun()
+        if pview == "upload":
+            statement_import_ui(customers)
+        else:
+            selected_month = st.date_input(t("Billing Month", "பில் மாதம்"), value=date.today())
+            month_key = selected_month.strftime("%Y-%m")
+            options = {f"{c[1]}": c[0] for c in customers}
+            selected = st.selectbox(t("Select Customer", "வாடிக்கையாளரை தேர்ந்தெடுக்கவும்"), list(options.keys()))
+            cid = options[selected]
+
+            summary = get_monthly_summary(cid, month_key)
+            payments = get_payments(cid, month_key)
+            paid = sum(float(p[3]) for p in payments)
+            balance = summary["total"] - paid
+
+            st.metric(t("Outstanding Balance", "நிலுவைத் தொகை"), f"₹{_m(balance)}")
+
+            with st.form("payment_form"):
+                amount = st.number_input(t("Amount (₹)", "தொகை (₹)"), min_value=0.0, value=max(balance, 0.0))
+                payment_date = st.date_input(t("Date", "தேதி"), value=date.today())
+                method = st.selectbox(t("Method", "முறை"), ["UPI", "Cash", "Bank Transfer"])
+                note = st.text_input(t("Note", "குறிப்பு"))
+
+                if st.form_submit_button(t("Record Payment", "பதிவு செய்"), type="primary"):
+                    if amount > 0:
+                        add_payment(cid, month_key, payment_date.isoformat(), amount, method, note)
+                        st.toast(t("Payment Recorded!", "தொகை பதிவு செய்யப்பட்டது!"), icon="💵")
+                        st.rerun()
+
+            if payments:
+                st.markdown("#### " + t("Payments recorded for this month", "இந்த மாதம் பதிவான தொகைகள்"))
+                pdf = pd.DataFrame([{"ID": p[0], "Date": str(p[2]), "Amount (₹)": float(p[3]), "Method": p[4], "Note": p[5] or ""} for p in payments])
+                st.dataframe(pdf, use_container_width=True, hide_index=True, column_config=num_cfg(pdf))
+                with st.expander(t("🗑️ Delete a payment (recorded by mistake)", "🗑️ தவறான பதிவை நீக்கு")):
+                    plabel = {p[0]: f"{p[2]} · ₹{_m(p[3])} · {p[4]}" for p in payments}
+                    del_id = st.selectbox(t("Payment", "பதிவு"), list(plabel), format_func=plabel.get)
+                    if st.button(t("Delete this payment", "இந்த பதிவை நீக்கு"), type="primary"):
+                        delete_payment(del_id)
+                        st.toast(t("Payment deleted", "பதிவு நீக்கப்பட்டது"), icon="🗑️")
+                        st.rerun()
 
 # ---------------- Reports ----------------
 elif menu == "Reports":
-    st.subheader(t("Reports & Analytics", "அறிக்கைகள் & பகுப்பாய்வு"))
-    
+    st.subheader(t("Reports & Exports", "அறிக்கைகள்"))
     s_date, e_date, period_label = render_date_range_picker("rep")
-    st.info(f"📆 **{t('Selected Period:', 'தேர்ந்தெடுக்கப்பட்ட காலம்:')}** `{period_label}`")
 
-    st.markdown(f"### 📊 {t('Brand & Profit Summary', 'பிராண்ட் மற்றும் லாப சுருக்கம்')}")
-    breakdown = get_item_breakdown_by_date_range(s_date, e_date)
-    if breakdown:
-        table_data = []
-        total_del_qty = 0
-        total_undel_cnt = 0
-        total_cost = 0.0
-        total_sell = 0.0
-        total_profit = 0.0
-        
-        for b in breakdown:
-            total_del_qty += b["delivered_qty"]
-            total_undel_cnt += b["undelivered_count"]
-            total_cost += b["total_cost"]
-            total_sell += b["total_sell"]
-            total_profit += b["profit"]
-            
-            table_data.append({
-                t("Product / Brand", "பொருள் / பிராண்ட்"): b["item_name"],
-                t("Delivered Quantity", "விநியோகிக்கப்பட்ட அளவு"): f"{b['delivered_qty']:g}",
-                t("Not Delivered Count", "பால் வாங்காத எண்ணிக்கை"): b["undelivered_count"],
-                t("Total Cost (₹)", "மொத்த அடக்க விலை (₹)"): f"₹{b['total_cost']:,.2f}",
-                t("Total Revenue (₹)", "மொத்த விற்பனை தொகை (₹)"): f"₹{b['total_sell']:,.2f}",
-                t("Net Profit (₹)", "நிகர லாபம் (₹)"): f"₹{b['profit']:,.2f}"
-            })
-        
-        st.dataframe(table_data, use_container_width=True)
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric(t("Total Quantity Delivered", "மொத்த விநியோக அளவு"), f"{total_del_qty:g}")
-        m2.metric(t("Total Cost (₹)", "மொத்த அடக்க விலை (₹)"), f"₹{total_cost:,.2f}")
-        m3.metric(t("Total Revenue (₹)", "மொத்த வருவாய் (₹)"), f"₹{total_sell:,.2f}")
-        m4.metric(t("Net Profit (₹)", "நிகர லாபம் (₹)"), f"₹{total_profit:,.2f}", delta=f"₹{total_profit:,.2f}")
-    else:
-        st.info(t("No delivery records found for the selected period.", "தேர்ந்தெடுக்கப்பட்ட காலத்தில் விநியோக பதிவுகள் இல்லை."))
-
-    st.markdown("---")
-    
-    st.markdown(f"### 📅 {t('Day-by-Day Breakdown (1 to 30/31)', 'நாள் வாரியான கணக்கீடு (1 முதல் 30/31 வரை)')}")
-    daily_rows = get_daily_breakdown_by_date_range(s_date, e_date)
-    matrix = get_daily_brand_matrix(s_date, e_date)
-
-    if daily_rows:
-        daily_table = []
-        for row in daily_rows:
-            d = row["delivery_date"]
-            b_map = matrix.get(d, {})
-            
-            entry = {
-                t("Date", "தேதி"): d,
-                t("Delivered Cust", "பால் பெற்றவர்கள்"): row["delivered_cust"],
-                t("No Milk Cust", "பால் வாங்காதவர்கள்"): row["undelivered_cust"],
-                t("Total Delivered Qty", "மொத்த அளவு"): f"{row['delivered_qty']:g}",
-                t("Total Cost (₹)", "மொத்த செலவு (₹)"): f"₹{row['total_cost']:,.2f}",
-                t("Total Revenue (₹)", "மொத்த வருவாய் (₹)"): f"₹{row['total_sell']:,.2f}",
-                t("Profit (₹)", "லாபம் (₹)"): f"₹{row['profit']:,.2f}"
-            }
-            
-            for item in AVAILABLE_ITEMS:
-                entry[item] = f"{b_map.get(item, 0.0):g}"
-            
-            daily_table.append(entry)
-
-        st.dataframe(daily_table, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown(f"### 📥 {t('Export Reports & Summaries', 'அறிக்கைகள் பதிவிறக்கம்')}")
     col_ex1, col_ex2, col_ex3 = st.columns(3)
-    
-    range_csv = export_range_deliveries_csv(s_date, e_date)
     col_ex1.download_button(
-        t("⬇️ Export Detailed Deliveries CSV", "⬇️ விரிவான விநியோகங்கள் CSV"),
-        data=range_csv,
+        t("⬇️ Detailed Deliveries CSV", "⬇️ விரிவான விநியோகங்கள் CSV"),
+        data=export_range_deliveries_csv(s_date, e_date),
         file_name=f"deliveries_{s_date}_to_{e_date}.csv",
         mime="text/csv",
         type="primary"
     )
-
-    daily_summary_csv = export_daily_summary_csv(s_date, e_date)
     col_ex2.download_button(
-        t("⬇️ Export Day-by-Day Summary CSV", "⬇️ நாள் வாரியான சுருக்கம் CSV"),
-        data=daily_summary_csv,
-        file_name=f"daily_summary_{s_date}_to_{e_date}.csv",
-        mime="text/primary"
+        t("⬇️ Day-by-Day Summary CSV", "⬇️ நாள் வாரியான சுருக்கம் CSV"),
+        data=export_daily_summary_csv(s_date, e_date),
+        file_name=f"summary_{s_date}_to_{e_date}.csv",
+        mime="text/csv"
     )
-    
     col_ex3.download_button(
-        t("⬇️ Export Master Customers CSV", "⬇️ அனைத்து வாடிக்கையாளர்கள் மாஸ்டர் CSV"),
-        data=export_customers_csv(),
-        file_name="customers_list.csv",
+        t("⬇️ Extra Milk Report CSV", "⬇️ கூடுதல் பால் அறிக்கை CSV"),
+        data=export_extra_report_csv(s_date, e_date),
+        file_name=f"extra_milk_{s_date}_to_{e_date}.csv",
         mime="text/csv"
     )
